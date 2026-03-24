@@ -237,7 +237,7 @@ export default function Usage() {
                     <TableRow>
                       <TableHead className="text-[14px] font-semibold">状态</TableHead>
                       <TableHead className="text-[14px] font-semibold">模型</TableHead>
-                      <TableHead className="text-[14px] font-semibold">推理强度</TableHead>
+                      <TableHead className="text-[14px] font-semibold">来源账号</TableHead>
                       <TableHead className="text-[14px] font-semibold">端点</TableHead>
                       <TableHead className="text-[14px] font-semibold">类型</TableHead>
                       <TableHead className="text-[14px] font-semibold">TOKEN</TableHead>
@@ -260,28 +260,31 @@ export default function Usage() {
                           </Badge>
                         </TableCell>
                         <TableCell>
-                          <Badge variant="outline" className="text-[14px]">
-                            {log.model || '-'}
-                          </Badge>
-                        </TableCell>
-                        <TableCell>
-                          {log.reasoning_effort ? (
-                            <Badge
-                              variant="outline"
-                              className="text-[13px]"
-                              style={{
-                                background: log.reasoning_effort === 'high' ? 'rgba(239, 68, 68, 0.12)' :
-                                           log.reasoning_effort === 'medium' ? 'rgba(245, 158, 11, 0.12)' :
-                                           'rgba(34, 197, 94, 0.12)',
-                                color: log.reasoning_effort === 'high' ? '#ef4444' :
-                                       log.reasoning_effort === 'medium' ? '#f59e0b' :
-                                       '#22c55e',
-                                borderColor: 'transparent',
-                              }}
-                            >
-                              {log.reasoning_effort}
+                          <div className="flex items-center gap-1.5 flex-wrap">
+                            <Badge variant="outline" className="text-[14px]">
+                              {log.model || '-'}
                             </Badge>
-                          ) : <span className="text-[14px] text-muted-foreground">-</span>}
+                            {log.reasoning_effort && (
+                              <Badge
+                                variant="outline"
+                                className="text-[12px]"
+                                style={{
+                                  background: log.reasoning_effort === 'high' ? 'rgba(239, 68, 68, 0.12)' :
+                                             log.reasoning_effort === 'medium' ? 'rgba(245, 158, 11, 0.12)' :
+                                             'rgba(34, 197, 94, 0.12)',
+                                  color: log.reasoning_effort === 'high' ? '#ef4444' :
+                                         log.reasoning_effort === 'medium' ? '#f59e0b' :
+                                         '#22c55e',
+                                  borderColor: 'transparent',
+                                }}
+                              >
+                                {log.reasoning_effort}
+                              </Badge>
+                            )}
+                          </div>
+                        </TableCell>
+                        <TableCell className="text-[14px] text-muted-foreground">
+                          {log.account_email || '-'}
                         </TableCell>
                         <TableCell>
                           <div className="text-[14px] leading-relaxed">

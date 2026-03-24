@@ -59,6 +59,7 @@ export interface UsageStats {
   total_tokens: number
   total_prompt_tokens: number
   total_completion_tokens: number
+  total_cached_tokens: number
   today_requests: number
   today_tokens: number
   rpm: number
@@ -86,6 +87,7 @@ export interface UsageLog {
   upstream_endpoint: string
   stream: boolean
   cached_tokens: number
+  account_email: string
   created_at: ISODateString
 }
 

@@ -4,42 +4,26 @@ import { api } from '../api'
 import PageHeader from '../components/PageHeader'
 import StateShell from '../components/StateShell'
 import StatCard from '../components/StatCard'
-import StatusBadge from '../components/StatusBadge'
-import type { AccountRow, StatsResponse } from '../types'
+import type { StatsResponse, UsageStats } from '../types'
 import { useDataLoader } from '../hooks/useDataLoader'
-import { formatRelativeTime } from '../utils/time'
 import { Card, CardContent } from '@/components/ui/card'
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from '@/components/ui/table'
-import { Users, CheckCircle, XCircle, Activity } from 'lucide-react'
+import { Users, CheckCircle, XCircle, Activity, Zap, Clock, AlertTriangle, BarChart3, Database } from 'lucide-react'
 
 export default function Dashboard() {
   const loadDashboardData = useCallback(async () => {
-    const [stats, accountsResponse] = await Promise.all([api.getStats(), api.getAccounts()])
-    return {
-      stats,
-      accounts: accountsResponse.accounts ?? [],
-    }
+    const [stats, usageStats] = await Promise.all([api.getStats(), api.getUsageStats()])
+    return { stats, usageStats }
   }, [])
 
   const { data, loading, error, reload } = useDataLoader<{
     stats: StatsResponse | null
-    accounts: AccountRow[]
+    usageStats: UsageStats | null
   }>({
-    initialData: {
-      stats: null,
-      accounts: [],
-    },
+    initialData: { stats: null, usageStats: null },
     load: loadDashboardData,
   })
 
-  const { stats, accounts } = data
+  const { stats, usageStats } = data
   const total = stats?.total ?? 0
   const available = stats?.available ?? 0
   const errorCount = stats?.error ?? 0
@@ -59,7 +43,7 @@ export default function Dashboard() {
       error={error}
       onRetry={() => void reload()}
       loadingTitle="正在加载仪表盘"
-      loadingDescription="系统统计和账号状态正在同步。"
+      loadingDescription="系统统计和使用数据正在同步。"
       errorTitle="仪表盘加载失败"
     >
       <>
@@ -69,6 +53,7 @@ export default function Dashboard() {
           onRefresh={() => void reload()}
         />
 
+        {/* 账号状态 */}
         <div className="grid grid-cols-[repeat(auto-fit,minmax(220px,1fr))] gap-4 mb-6">
           <StatCard icon={icons.total} iconClass="blue" label="总账号" value={total} />
           <StatCard
@@ -82,46 +67,77 @@ export default function Dashboard() {
           <StatCard icon={icons.requests} iconClass="purple" label="今日请求" value={todayRequests} />
         </div>
 
-        <Card>
-          <CardContent className="p-6">
-            <div className="flex items-center justify-between gap-4 mb-4">
-              <h3 className="text-base font-semibold text-foreground">账号状态</h3>
-              <span className="text-xs text-muted-foreground">{accounts.length} 个账号</span>
-            </div>
-            <StateShell
-              variant="section"
-              isEmpty={accounts.length === 0}
-              emptyTitle="暂无账号数据"
-              emptyDescription="账号加入代理池后，会在这里展示状态和最近更新时间。"
-            >
-              <div className="overflow-auto border border-border rounded-xl">
-                <Table>
-                  <TableHeader>
-                    <TableRow>
-                      <TableHead className="text-[13px] font-semibold">名称</TableHead>
-                      <TableHead className="text-[13px] font-semibold">邮箱</TableHead>
-                      <TableHead className="text-[13px] font-semibold">套餐</TableHead>
-                      <TableHead className="text-[13px] font-semibold">状态</TableHead>
-                      <TableHead className="text-[13px] font-semibold">更新时间</TableHead>
-                    </TableRow>
-                  </TableHeader>
-                  <TableBody>
-                    {accounts.map((account) => (
-                      <TableRow key={account.id}>
-                        <TableCell className="text-[14px] font-medium">{account.name || `账号 #${account.id}`}</TableCell>
-                        <TableCell className="text-[14px] text-muted-foreground">{account.email || '-'}</TableCell>
-                        <TableCell className="text-[14px] font-mono">{account.plan_type || '-'}</TableCell>
-                        <TableCell><StatusBadge status={account.status} /></TableCell>
-                        <TableCell className="text-[14px] text-muted-foreground">{formatRelativeTime(account.updated_at)}</TableCell>
-                      </TableRow>
-                    ))}
-                  </TableBody>
-                </Table>
+        {/* 使用统计 */}
+        {usageStats && (
+          <Card>
+            <CardContent className="p-6">
+              <h3 className="text-base font-semibold text-foreground mb-4">使用统计</h3>
+              <div className="grid grid-cols-[repeat(auto-fit,minmax(200px,1fr))] gap-4">
+                <StatItem
+                  icon={<BarChart3 className="size-5" />}
+                  iconBg="bg-blue-500/10 text-blue-500"
+                  label="总请求"
+                  value={usageStats.total_requests.toLocaleString()}
+                />
+                <StatItem
+                  icon={<Zap className="size-5" />}
+                  iconBg="bg-purple-500/10 text-purple-500"
+                  label="总 Token"
+                  value={usageStats.total_tokens.toLocaleString()}
+                />
+                <StatItem
+                  icon={<Zap className="size-5" />}
+                  iconBg="bg-emerald-500/10 text-emerald-500"
+                  label="今日 Token"
+                  value={usageStats.today_tokens.toLocaleString()}
+                />
+                <StatItem
+                  icon={<Database className="size-5" />}
+                  iconBg="bg-indigo-500/10 text-indigo-500"
+                  label="缓存读取 Token"
+                  value={usageStats.total_cached_tokens.toLocaleString()}
+                />
+                <StatItem
+                  icon={<Activity className="size-5" />}
+                  iconBg="bg-amber-500/10 text-amber-500"
+                  label="RPM / TPM"
+                  value={`${usageStats.rpm} / ${usageStats.tpm.toLocaleString()}`}
+                />
+                <StatItem
+                  icon={<Clock className="size-5" />}
+                  iconBg="bg-cyan-500/10 text-cyan-500"
+                  label="平均延迟"
+                  value={
+                    usageStats.avg_duration_ms > 1000
+                      ? `${(usageStats.avg_duration_ms / 1000).toFixed(1)}s`
+                      : `${Math.round(usageStats.avg_duration_ms)}ms`
+                  }
+                />
+                <StatItem
+                  icon={<AlertTriangle className="size-5" />}
+                  iconBg="bg-red-500/10 text-red-500"
+                  label="今日错误率"
+                  value={`${usageStats.error_rate.toFixed(1)}%`}
+                />
               </div>
-            </StateShell>
-          </CardContent>
-        </Card>
+            </CardContent>
+          </Card>
+        )}
       </>
     </StateShell>
+  )
+}
+
+function StatItem({ icon, iconBg, label, value }: { icon: ReactNode; iconBg: string; label: string; value: string }) {
+  return (
+    <div className="flex items-center gap-3 p-4 rounded-xl bg-muted/50">
+      <div className={`flex items-center justify-center size-10 rounded-lg ${iconBg}`}>
+        {icon}
+      </div>
+      <div>
+        <div className="text-xs text-muted-foreground">{label}</div>
+        <div className="text-lg font-bold">{value}</div>
+      </div>
+    </div>
   )
 }

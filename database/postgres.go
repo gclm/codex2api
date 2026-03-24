@@ -265,6 +265,7 @@ type UsageLog struct {
 	UpstreamEndpoint string    `json:"upstream_endpoint"`
 	Stream           bool      `json:"stream"`
 	CachedTokens     int       `json:"cached_tokens"`
+	AccountEmail     string    `json:"account_email"`
 	CreatedAt        time.Time `json:"created_at"`
 }
 
@@ -390,16 +391,17 @@ func (db *DB) flushLogs() {
 
 // UsageStats 使用统计
 type UsageStats struct {
-	TotalRequests   int64   `json:"total_requests"`
-	TotalTokens     int64   `json:"total_tokens"`
-	TotalPrompt     int64   `json:"total_prompt_tokens"`
-	TotalCompletion int64   `json:"total_completion_tokens"`
-	TodayRequests   int64   `json:"today_requests"`
-	TodayTokens     int64   `json:"today_tokens"`
-	RPM             float64 `json:"rpm"`
-	TPM             float64 `json:"tpm"`
-	AvgDurationMs   float64 `json:"avg_duration_ms"`
-	ErrorRate       float64 `json:"error_rate"`
+	TotalRequests     int64   `json:"total_requests"`
+	TotalTokens       int64   `json:"total_tokens"`
+	TotalPrompt       int64   `json:"total_prompt_tokens"`
+	TotalCompletion   int64   `json:"total_completion_tokens"`
+	TotalCachedTokens int64   `json:"total_cached_tokens"`
+	TodayRequests     int64   `json:"today_requests"`
+	TodayTokens       int64   `json:"today_tokens"`
+	RPM               float64 `json:"rpm"`
+	TPM               float64 `json:"tpm"`
+	AvgDurationMs     float64 `json:"avg_duration_ms"`
+	ErrorRate         float64 `json:"error_rate"`
 }
 
 // GetUsageStats 获取使用统计（单条 SQL，避免 5 次查询）
@@ -414,6 +416,7 @@ func (db *DB) GetUsageStats(ctx context.Context) (*UsageStats, error) {
 		COALESCE(SUM(total_tokens), 0)                               AS total_tokens,
 		COALESCE(SUM(prompt_tokens), 0)                              AS total_prompt,
 		COALESCE(SUM(completion_tokens), 0)                          AS total_completion,
+		COALESCE(SUM(cached_tokens), 0)                              AS total_cached,
 		-- 今日
 		COUNT(*)    FILTER (WHERE created_at >= CURRENT_DATE)        AS today_requests,
 		COALESCE(SUM(total_tokens) FILTER (WHERE created_at >= CURRENT_DATE), 0) AS today_tokens,
@@ -429,7 +432,7 @@ func (db *DB) GetUsageStats(ctx context.Context) (*UsageStats, error) {
 
 	var todayErrors int64
 	err := db.conn.QueryRowContext(ctx, query).Scan(
-		&stats.TotalRequests, &stats.TotalTokens, &stats.TotalPrompt, &stats.TotalCompletion,
+		&stats.TotalRequests, &stats.TotalTokens, &stats.TotalPrompt, &stats.TotalCompletion, &stats.TotalCachedTokens,
 		&stats.TodayRequests, &stats.TodayTokens,
 		&stats.RPM, &stats.TPM,
 		&stats.AvgDurationMs,
@@ -451,11 +454,14 @@ func (db *DB) ListRecentUsageLogs(ctx context.Context, limit int) ([]*UsageLog, 
 	if limit <= 0 || limit > 200 {
 		limit = 50
 	}
-	query := `SELECT id, account_id, endpoint, model, prompt_tokens, completion_tokens, total_tokens, status_code, duration_ms,
-	            COALESCE(input_tokens, 0), COALESCE(output_tokens, 0), COALESCE(reasoning_tokens, 0),
-	            COALESCE(first_token_ms, 0), COALESCE(reasoning_effort, ''), COALESCE(inbound_endpoint, ''),
-	            COALESCE(upstream_endpoint, ''), COALESCE(stream, false), COALESCE(cached_tokens, 0), created_at
-	           FROM usage_logs ORDER BY id DESC LIMIT $1`
+	query := `SELECT u.id, u.account_id, u.endpoint, u.model, u.prompt_tokens, u.completion_tokens, u.total_tokens, u.status_code, u.duration_ms,
+	            COALESCE(u.input_tokens, 0), COALESCE(u.output_tokens, 0), COALESCE(u.reasoning_tokens, 0),
+	            COALESCE(u.first_token_ms, 0), COALESCE(u.reasoning_effort, ''), COALESCE(u.inbound_endpoint, ''),
+	            COALESCE(u.upstream_endpoint, ''), COALESCE(u.stream, false), COALESCE(u.cached_tokens, 0),
+	            COALESCE(a.credentials->>'email', ''), u.created_at
+	           FROM usage_logs u
+	           LEFT JOIN accounts a ON u.account_id = a.id
+	           ORDER BY u.id DESC LIMIT $1`
 	rows, err := db.conn.QueryContext(ctx, query, limit)
 	if err != nil {
 		return nil, err
@@ -466,7 +472,8 @@ func (db *DB) ListRecentUsageLogs(ctx context.Context, limit int) ([]*UsageLog, 
 	for rows.Next() {
 		l := &UsageLog{}
 		if err := rows.Scan(&l.ID, &l.AccountID, &l.Endpoint, &l.Model, &l.PromptTokens, &l.CompletionTokens, &l.TotalTokens, &l.StatusCode, &l.DurationMs,
-			&l.InputTokens, &l.OutputTokens, &l.ReasoningTokens, &l.FirstTokenMs, &l.ReasoningEffort, &l.InboundEndpoint, &l.UpstreamEndpoint, &l.Stream, &l.CachedTokens, &l.CreatedAt); err != nil {
+			&l.InputTokens, &l.OutputTokens, &l.ReasoningTokens, &l.FirstTokenMs, &l.ReasoningEffort, &l.InboundEndpoint, &l.UpstreamEndpoint, &l.Stream, &l.CachedTokens,
+			&l.AccountEmail, &l.CreatedAt); err != nil {
 			return nil, err
 		}
 		logs = append(logs, l)
