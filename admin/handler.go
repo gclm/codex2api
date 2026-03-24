@@ -47,6 +47,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.GET("/health", h.GetHealth)
 	api.GET("/settings", h.GetSettings)
 	api.PUT("/settings", h.UpdateSettings)
+	api.GET("/models", h.ListModels)
 }
 
 // ==================== Stats ====================
@@ -425,13 +426,15 @@ func (h *Handler) DeleteAPIKey(c *gin.Context) {
 // ==================== Settings ====================
 
 type settingsResponse struct {
-	MaxConcurrency int `json:"max_concurrency"`
-	GlobalRPM      int `json:"global_rpm"`
+	MaxConcurrency int    `json:"max_concurrency"`
+	GlobalRPM      int    `json:"global_rpm"`
+	TestModel      string `json:"test_model"`
 }
 
 type updateSettingsReq struct {
-	MaxConcurrency *int `json:"max_concurrency"`
-	GlobalRPM      *int `json:"global_rpm"`
+	MaxConcurrency *int    `json:"max_concurrency"`
+	GlobalRPM      *int    `json:"global_rpm"`
+	TestModel      *string `json:"test_model"`
 }
 
 // GetSettings 获取当前系统设置
@@ -439,6 +442,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 	c.JSON(http.StatusOK, settingsResponse{
 		MaxConcurrency: h.store.GetMaxConcurrency(),
 		GlobalRPM:      h.rateLimiter.GetRPM(),
+		TestModel:      h.store.GetTestModel(),
 	})
 }
 
@@ -471,8 +475,21 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		log.Printf("设置已更新: global_rpm = %d", v)
 	}
 
+	if req.TestModel != nil && *req.TestModel != "" {
+		h.store.SetTestModel(*req.TestModel)
+		log.Printf("设置已更新: test_model = %s", *req.TestModel)
+	}
+
 	c.JSON(http.StatusOK, settingsResponse{
 		MaxConcurrency: h.store.GetMaxConcurrency(),
 		GlobalRPM:      h.rateLimiter.GetRPM(),
+		TestModel:      h.store.GetTestModel(),
 	})
+}
+
+// ==================== Models ====================
+
+// ListModels 返回支持的模型列表（供前端设置页使用）
+func (h *Handler) ListModels(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{"models": proxy.SupportedModels})
 }

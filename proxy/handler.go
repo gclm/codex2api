@@ -803,21 +803,18 @@ func (h *Handler) handleUpstreamError(c *gin.Context, account *auth.Account, sta
 	h.sendUpstreamError(c, statusCode, body)
 }
 
+// SupportedModels 支持的模型列表（全局共享）
+var SupportedModels = []string{
+	"gpt-5.4", "gpt-5.4-mini", "gpt-5", "gpt-5-codex", "gpt-5-codex-mini",
+	"gpt-5.1", "gpt-5.1-codex", "gpt-5.1-codex-mini", "gpt-5.1-codex-max",
+	"gpt-5.2", "gpt-5.2-codex", "gpt-5.3-codex",
+}
+
 // ListModels 列出可用模型
 func (h *Handler) ListModels(c *gin.Context) {
-	models := []gin.H{
-		{"id": "gpt-5.4", "object": "model", "owned_by": "openai"},
-		{"id": "gpt-5.4-mini", "object": "model", "owned_by": "openai"},
-		{"id": "gpt-5", "object": "model", "owned_by": "openai"},
-		{"id": "gpt-5-codex", "object": "model", "owned_by": "openai"},
-		{"id": "gpt-5-codex-mini", "object": "model", "owned_by": "openai"},
-		{"id": "gpt-5.1", "object": "model", "owned_by": "openai"},
-		{"id": "gpt-5.1-codex", "object": "model", "owned_by": "openai"},
-		{"id": "gpt-5.1-codex-mini", "object": "model", "owned_by": "openai"},
-		{"id": "gpt-5.1-codex-max", "object": "model", "owned_by": "openai"},
-		{"id": "gpt-5.2", "object": "model", "owned_by": "openai"},
-		{"id": "gpt-5.2-codex", "object": "model", "owned_by": "openai"},
-		{"id": "gpt-5.3-codex", "object": "model", "owned_by": "openai"},
+	models := make([]gin.H, 0, len(SupportedModels))
+	for _, id := range SupportedModels {
+		models = append(models, gin.H{"id": id, "object": "model", "owned_by": "openai"})
 	}
 	c.JSON(http.StatusOK, gin.H{
 		"object": "list",

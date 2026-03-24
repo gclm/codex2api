@@ -69,8 +69,8 @@ func getPooledClient(proxyURL string) *http.Client {
 // Codex 上游常量
 const (
 	CodexBaseURL = "https://chatgpt.com/backend-api/codex"
-	UserAgent    = "codex_cli_rs/0.101.0 (Mac OS 26.0.1; arm64) Apple_Terminal/464"
-	Version      = "0.101.0"
+	UserAgent    = "codex_cli_rs/0.116.0 (Mac OS 26.0.1; arm64) Apple_Terminal/464"
+	Version      = "0.116.0"
 	Originator   = "codex_cli_rs"
 )
 

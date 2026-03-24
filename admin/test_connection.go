@@ -58,7 +58,7 @@ func (h *Handler) TestConnection(c *gin.Context) {
 	c.Header("X-Accel-Buffering", "no")
 	c.Writer.Flush()
 
-	testModel := "codex-mini-latest"
+	testModel := h.store.GetTestModel()
 
 	// 发送 test_start
 	sendTestEvent(c, testEvent{Type: "test_start", Model: testModel})

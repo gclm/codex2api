@@ -169,7 +169,8 @@ type Store struct {
 	mu             sync.RWMutex
 	accounts       []*Account
 	globalProxy    string
-	maxConcurrency int64 // 每账号最大并发数
+	maxConcurrency int64        // 每账号最大并发数
+	testModel      atomic.Value // 测试连接使用的模型（string）
 	db             *database.DB
 	tokenCache     *cache.TokenCache
 	stopCh         chan struct{}
@@ -178,13 +179,15 @@ type Store struct {
 
 // NewStore 创建账号管理器
 func NewStore(cfg *config.Config, db *database.DB, tc *cache.TokenCache) *Store {
-	return &Store{
+	s := &Store{
 		globalProxy:    cfg.ProxyURL,
 		maxConcurrency: int64(cfg.MaxConcurrency),
 		db:             db,
 		tokenCache:     tc,
 		stopCh:         make(chan struct{}),
 	}
+	s.testModel.Store(cfg.TestModel)
+	return s
 }
 
 // Init 初始化：从 PG 加载账号
@@ -380,6 +383,19 @@ func (s *Store) SetMaxConcurrency(n int) {
 // GetMaxConcurrency 获取当前每账号并发上限
 func (s *Store) GetMaxConcurrency() int {
 	return int(atomic.LoadInt64(&s.maxConcurrency))
+}
+
+// SetTestModel 动态更新测试连接模型
+func (s *Store) SetTestModel(m string) {
+	s.testModel.Store(m)
+}
+
+// GetTestModel 获取当前测试连接模型
+func (s *Store) GetTestModel() string {
+	if v, ok := s.testModel.Load().(string); ok && v != "" {
+		return v
+	}
+	return "gpt-5.4"
 }
 
 // AddAccount 热加载新账号到内存池（前端添加后即刻生效）

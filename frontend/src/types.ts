@@ -60,6 +60,7 @@ export interface HealthResponse {
 export interface SystemSettings {
   max_concurrency: number
   global_rpm: number
+  test_model: string
 }
 
 export interface UsageStats {

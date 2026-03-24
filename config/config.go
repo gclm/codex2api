@@ -49,6 +49,7 @@ type Config struct {
 	ProxyURL       string          `yaml:"proxy_url"`
 	MaxConcurrency int             `yaml:"max_concurrency"` // 每账号最大并发数，默认 2
 	GlobalRPM      int             `yaml:"global_rpm"`      // 全局 RPM 限制，0 = 不限制
+	TestModel      string          `yaml:"test_model"`      // 测试连接使用的模型，默认 gpt-5.4
 	Database       DatabaseConfig  `yaml:"database"`
 	Redis          RedisConfig     `yaml:"redis"`
 	Accounts       []AccountConfig `yaml:"accounts"` // 可选：首次启动时通过 YAML/环境变量导入 RT 到数据库
@@ -136,6 +137,9 @@ func Load(path string) (*Config, error) {
 			cfg.GlobalRPM = n
 		}
 	}
+	if v := os.Getenv("CODEX_TEST_MODEL"); v != "" {
+		cfg.TestModel = v
+	}
 
 	// 校验必需配置
 	if cfg.Database.Host == "" {
@@ -154,6 +158,9 @@ func Load(path string) (*Config, error) {
 	// 限流默认值
 	if cfg.MaxConcurrency <= 0 {
 		cfg.MaxConcurrency = 2
+	}
+	if cfg.TestModel == "" {
+		cfg.TestModel = "gpt-5.4"
 	}
 
 	return cfg, nil
