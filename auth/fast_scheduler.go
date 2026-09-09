@@ -34,6 +34,8 @@ type fastSchedulerPosition struct {
 // 调度策略：调度优先级全局优先；同优先级内按健康层级分桶，
 // 桶内按调度分排序后 round-robin。
 // 验证过的账号只作为同分 tie-breaker，避免历史请求量盖过额度快重置优先级。
+// 取号时在同用量档（round_robin 则在整个优先级段）优先 OccupiedRequests
+// 最低的账号，把突发并发摊开，降低单号瞬时 429。
 //
 // fill_first 模式（issue #501）：同优先级内按 7d 用量降序排列并始终从队首
 // 取号，流量集中在剩余额度最少的账号上；该账号限流/耗尽后自然滑落到下一个，
@@ -552,7 +554,17 @@ func (s *FastScheduler) acquireExcludingWithDispatch(apiKeyID int64, exclude map
 	}
 }
 
-// scanRangeLocked 在 bucket[start:end) 范围内 round-robin 扫描可用账号。
+type fastSchedulerCandidate struct {
+	acc      *Account
+	occupied int64
+	usage    float64
+	order    int
+	limit    int64
+}
+
+// scanRangeLocked 在 bucket[start:end) 范围内扫描可用账号。
+// 会话亲和仍按哈希落点取第一个可用号；其余请求在同用量档（或 round_robin
+// 的整个优先级段）里优先 OccupiedRequests 最低的账号，用扫描顺序打平。
 // 返回 stale=true 表示桶内缓存已过期，调用方应重新开始扫描。
 func (s *FastScheduler) scanRangeLocked(expectedTier AccountHealthTier, rangeStart, rangeEnd int, cursor *atomic.Uint64, affinityHash *uint64, baseLimit int64, now time.Time, apiKeyID int64, exclude map[int64]bool, filter AccountFilter, policy DispatchPolicy) (*Account, bool) {
 	bucket := s.buckets[expectedTier]
@@ -564,6 +576,7 @@ func (s *FastScheduler) scanRangeLocked(expectedTier AccountHealthTier, rangeSta
 	if affinityHash != nil {
 		start = int(*affinityHash % uint64(rangeLen))
 	}
+	var candidates []fastSchedulerCandidate
 	for offset := 0; offset < rangeLen; offset++ {
 		entry := bucket[rangeStart+(start+offset)%rangeLen]
 		if entry.acc == nil {
@@ -603,10 +616,47 @@ func (s *FastScheduler) scanRangeLocked(expectedTier AccountHealthTier, rangeSta
 		if !available || limit <= 0 {
 			continue
 		}
-		if !s.tryAcquireAccount(entry.acc, limit) {
+		occupied := accountOccupiedRequests(entry.acc)
+		if occupied >= limit {
 			continue
 		}
-		return entry.acc, false
+		if affinityHash != nil {
+			if !s.tryAcquireAccount(entry.acc, limit) {
+				continue
+			}
+			return entry.acc, false
+		}
+		candidates = append(candidates, fastSchedulerCandidate{
+			acc:      entry.acc,
+			occupied: occupied,
+			usage:    entry.acc.usagePercentForScheduling(),
+			order:    offset,
+			limit:    limit,
+		})
+	}
+	if affinityHash != nil || len(candidates) == 0 {
+		return nil, false
+	}
+	if s.schedulerMode == "remaining_quota" || s.schedulerMode == "fill_first" {
+		targetUsage := candidates[0].usage
+		filtered := make([]fastSchedulerCandidate, 0, len(candidates))
+		for _, candidate := range candidates {
+			if candidate.usage == targetUsage {
+				filtered = append(filtered, candidate)
+			}
+		}
+		candidates = filtered
+	}
+	sort.SliceStable(candidates, func(i, j int) bool {
+		if candidates[i].occupied != candidates[j].occupied {
+			return candidates[i].occupied < candidates[j].occupied
+		}
+		return candidates[i].order < candidates[j].order
+	})
+	for _, candidate := range candidates {
+		if s.tryAcquireAccount(candidate.acc, candidate.limit) {
+			return candidate.acc, false
+		}
 	}
 	return nil, false
 }

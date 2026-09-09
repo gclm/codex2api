@@ -19,11 +19,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/codex2api/api"
+	"github.com/codex2api/auth"
 	"github.com/codex2api/database"
 	"github.com/gin-gonic/gin"
 )
@@ -277,6 +279,39 @@ func applyImageGenerationStripPolicy(c *gin.Context, body []byte) []byte {
 }
 
 // SendAPIKeyLimitError writes a standard /v1 API key limit error response.
+// usageLimitedPoolMessage is the downstream-facing text for a pool that has
+// candidates but all of them are rate-limited.
+type usageLimitedPoolMessage struct {
+	Chinese string
+	English string
+	// RetryAfterSeconds is non-zero only for a transient throttle; quota
+	// exhaustion deliberately carries no hint so downstream fails over.
+	RetryAfterSeconds int
+}
+
+const (
+	usageWindowExhaustedMessageZH = "Codex 账号用量窗口已达上限"
+	usageWindowExhaustedMessageEN = "Codex account usage window limit reached"
+)
+
+// usageLimitedPoolMessages distinguishes a short account-wide throttle from an
+// exhausted usage window so downstream gateways do not fail over or flag the
+// upstream on a freeze that clears in seconds.
+func usageLimitedPoolMessages(summary auth.UsageLimitedCandidateSummary) usageLimitedPoolMessage {
+	if !summary.TransientOnly {
+		return usageLimitedPoolMessage{Chinese: usageWindowExhaustedMessageZH, English: usageWindowExhaustedMessageEN}
+	}
+	seconds := int(math.Ceil(summary.RetryAfter.Seconds()))
+	if seconds < 1 {
+		seconds = 1
+	}
+	return usageLimitedPoolMessage{
+		Chinese:           fmt.Sprintf("Codex 账号瞬时限流中，请 %d 秒后重试", seconds),
+		English:           fmt.Sprintf("Codex accounts are temporarily throttled, retry after %d seconds", seconds),
+		RetryAfterSeconds: seconds,
+	}
+}
+
 func SendAPIKeyLimitError(c *gin.Context, status int, msg string) {
 	errType := api.ErrorTypeRateLimit
 	errCode := api.ErrCodeRateLimitReached

@@ -341,6 +341,14 @@ type Account struct {
 	LastTimeoutAt       time.Time
 	LastServerErrorAt   time.Time
 	LastRecoveryProbeAt time.Time
+	// transientRateLimitBackoff is the in-memory progressive cooldown
+	// exponent for account-wide Codex throttle (bare 429 / rate_limit*).
+	// It is not persisted: a restart simply starts again at 15s.
+	transientRateLimitBackoff int
+	// transientRateLimitUntil mirrors CooldownUtil while the active cooldown
+	// was created by MarkTransientRateLimited. A later quota cooldown moves
+	// CooldownUtil away from it, which is how the two are told apart.
+	transientRateLimitUntil time.Time
 
 	// 滑动窗口成功率（最近 N 次请求）
 	RecentResults    [20]uint8 // 1=成功, 0=失败
@@ -7221,10 +7229,32 @@ func (s *Store) HasUsageLimitedCandidateWithFilter(apiKeyID int64, exclude map[i
 }
 
 func (s *Store) HasUsageLimitedCandidateWithDispatch(apiKeyID int64, exclude map[int64]bool, filter AccountFilter, policy DispatchPolicy) bool {
+	return s.UsageLimitedCandidateSummary(apiKeyID, exclude, filter, policy).Found
+}
+
+// UsageLimitedCandidateSummary describes why an otherwise matching pool is
+// blocked by rate limits. Callers use it to tell a genuinely exhausted usage
+// window (downstream should fail over) from a short account-wide throttle
+// (downstream should just wait RetryAfter and try the same upstream again).
+type UsageLimitedCandidateSummary struct {
+	// Found is true when at least one matching account is usage-limited.
+	Found bool
+	// TransientOnly is true when every usage-limited candidate is blocked only
+	// by a MarkTransientRateLimited freeze, not by a quota window.
+	TransientOnly bool
+	// RetryAfter is the shortest remaining transient freeze. Zero unless
+	// TransientOnly.
+	RetryAfter time.Duration
+}
+
+func (s *Store) UsageLimitedCandidateSummary(apiKeyID int64, exclude map[int64]bool, filter AccountFilter, policy DispatchPolicy) UsageLimitedCandidateSummary {
+	var summary UsageLimitedCandidateSummary
 	if s == nil {
-		return false
+		return summary
 	}
 	filter = s.withUsableEgressFilter(filter)
+	now := time.Now()
+	quotaLimited := false
 	for _, acc := range s.accountSnapshotAccounts() {
 		if acc == nil || (exclude != nil && exclude[acc.DBID]) {
 			continue
@@ -7248,11 +7278,24 @@ func (s *Store) HasUsageLimitedCandidateWithDispatch(apiKeyID int64, exclude map
 				continue
 			}
 		}
-		if usageLimited {
-			return true
+		if !usageLimited {
+			continue
 		}
+		summary.Found = true
+		if remaining, ok := acc.TransientRateLimitRemaining(now); ok {
+			if summary.RetryAfter == 0 || remaining < summary.RetryAfter {
+				summary.RetryAfter = remaining
+			}
+			continue
+		}
+		quotaLimited = true
 	}
-	return false
+	if summary.Found && !quotaLimited {
+		summary.TransientOnly = true
+	} else {
+		summary.RetryAfter = 0
+	}
+	return summary
 }
 
 func (s *Store) hasContinuationCandidateWithFilter(key string, apiKeyID int64, exclude map[int64]bool, filter AccountFilter) bool {
@@ -9421,6 +9464,12 @@ func (s *Store) markCooldownUntil(acc *Account, until time.Time, reason string, 
 
 // markCooldown 根据 exactDuration 选择自适应或精确时长并应用账号冷却。
 func (s *Store) markCooldown(acc *Account, duration time.Duration, reason string, errorMsg string, exactDuration bool) {
+	s.markCooldownWithPersist(acc, duration, reason, errorMsg, exactDuration, true)
+}
+
+// markCooldownWithPersist 是 markCooldown 的底层实现；persist=false 时只更新内存、
+// 调度器与跨实例冷却缓存，不写 DB（秒级瞬时冷却重启即失效，落库没有意义）。
+func (s *Store) markCooldownWithPersist(acc *Account, duration time.Duration, reason string, errorMsg string, exactDuration bool, persist bool) {
 	if acc == nil {
 		return
 	}
@@ -9472,7 +9521,7 @@ func (s *Store) markCooldown(acc *Account, duration time.Duration, reason string
 	s.fastSchedulerUpdate(acc)
 	s.setCachedAccountCooldown(acc.DBID, reason, until)
 
-	if s.db == nil {
+	if s.db == nil || !persist {
 		return
 	}
 
@@ -9823,6 +9872,8 @@ func (s *Store) ClearCooldown(acc *Account) {
 	acc.CooldownReason = ""
 	// 人工清理即重新给自愈机会:重置死 RT 判定,恢复探测资格随之恢复。
 	acc.PermanentRefreshFailures = 0
+	acc.transientRateLimitBackoff = 0
+	acc.transientRateLimitUntil = time.Time{}
 	if wasCooling && !premium5hLimited {
 		acc.HealthTier = HealthTierWarm
 	} else if wasError && acc.HealthTier != HealthTierBanned {
@@ -10042,7 +10093,9 @@ func (s *Store) ReportRequestSuccess(acc *Account, latency time.Duration) {
 	acc.mu.Lock()
 	acc.recordLatencyLocked(latency)
 	acc.recordResultLocked(true)
-	acc.LastSuccessAt = time.Now()
+	now := time.Now()
+	acc.LastSuccessAt = now
+	acc.observeTransientRateLimitSuccessLocked(now)
 	acc.SuccessStreak = clampInt(acc.SuccessStreak+1, 0, 20)
 	acc.FailureStreak = 0
 	if acc.HealthTier == "" {

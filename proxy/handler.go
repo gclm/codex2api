@@ -15,6 +15,7 @@ import (
 	"os"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -3933,11 +3934,17 @@ func (h *Handler) Responses(c *gin.Context) {
 				SendAPIKeyLimitError(c, http.StatusTooManyRequests, msg)
 				return
 			}
-			if h.store.HasUsageLimitedCandidateWithDispatch(apiKeyID, retryExclusions.ForSelection(), accountFilter, dispatchPolicy) {
-				if isStream && writeCommittedResponsesRetryError(c, "Codex account usage window limit reached") {
+			if limited := h.store.UsageLimitedCandidateSummary(apiKeyID, retryExclusions.ForSelection(), accountFilter, dispatchPolicy); limited.Found {
+				// 瞬时 throttle 与额度耗尽要给下游不同信号：前者带 Retry-After 让它秒级
+				// 退避后重试同一上游，后者才值得 failover/标记账号。
+				msg := usageLimitedPoolMessages(limited)
+				if isStream && writeCommittedResponsesRetryError(c, msg.English) {
 					return
 				}
-				SendAPIKeyLimitError(c, http.StatusTooManyRequests, "Codex 账号用量窗口已达上限")
+				if msg.RetryAfterSeconds > 0 {
+					c.Header("Retry-After", strconv.Itoa(msg.RetryAfterSeconds))
+				}
+				SendAPIKeyLimitError(c, http.StatusTooManyRequests, msg.Chinese)
 				return
 			}
 			if continuationUnavailable && !relayContinuationAttempted {
@@ -7949,10 +7956,10 @@ func responseHasCodex5hHeaders(resp *http.Response) bool {
 	return secondary.valid && codexWindowType(secondary.windowMin) == codexRateLimitWindow5h
 }
 
-// classifySpark429RateLimit keeps every Spark rejection scoped to the Spark
-// model. Explicit quota evidence (body reset or an exhausted 5h/7d window)
-// drives the independent Spark usage window; transient
-// rejections retain the normal short model cooldown.
+// classifySpark429RateLimit keeps Spark quota exhaustion on the Spark model.
+// Explicit quota evidence (body reset or an exhausted 5h/7d window) drives
+// the independent Spark usage window. Transient throttles freeze the whole
+// account so a model alias cannot bypass the shared budget.
 func classifySpark429RateLimit(account *auth.Account, body []byte, resp *http.Response, now time.Time, model string) codex429Decision {
 	decision := codex429Decision{
 		Scope:  rateLimitScopeModel,
@@ -7997,8 +8004,12 @@ func classifySpark429RateLimit(account *auth.Account, body []byte, resp *http.Re
 		decision.ResetAt = now.Add(decision.Cooldown)
 		return decision
 	}
-	decision.Cooldown = 5 * time.Minute
-	return decision
+	if decision.Reason == "model_capacity" {
+		decision.Cooldown = 5 * time.Minute
+		return decision
+	}
+	// Spark 瞬时 throttle 与主模型共享账号预算；只冻 Spark 模型会被别名绕过。
+	return transientAccountRateLimitDecision(body, resp, now)
 }
 
 func classify429RateLimit(account *auth.Account, body []byte, resp *http.Response, now time.Time, model string) codex429Decision {
@@ -8054,22 +8065,48 @@ func classify429RateLimit(account *auth.Account, body []byte, resp *http.Respons
 		return codex429Decision{Scope: rateLimitScopeAccount, Reason: "rate_limited_7d", ResetAt: resetAt, Cooldown: resetAt.Sub(now)}
 	}
 
-	if model != "" {
-		reason := "rate_limited_model"
-		if isCodexModelCapacityError(body) {
-			reason = "model_capacity"
-		}
+	if isCodexModelCapacityError(body) && model != "" {
 		return codex429Decision{
 			Scope:    rateLimitScopeModel,
-			Reason:   reason,
+			Reason:   "model_capacity",
 			Model:    model,
 			Cooldown: 5 * time.Minute,
 		}
 	}
 
-	cooldown := 5 * time.Minute
-	resetAt = now.Add(cooldown)
-	return codex429Decision{Scope: rateLimitScopeAccount, Reason: "rate_limited", ResetAt: resetAt, Cooldown: cooldown}
+	// 裸 429 / rate_limit* 是账号级瞬时限流。只冻当前模型时，同一号换个别名
+	// 会立刻再打上游。额度耗尽与 5h/7d=100% 已在上面分流。
+	return transientAccountRateLimitDecision(body, resp, now)
+}
+
+func transientAccountRateLimitDecision(body []byte, resp *http.Response, now time.Time) codex429Decision {
+	cooldown := auth.TransientRateLimitBackoffBase
+	if retryAfter := transient429RetryAfter(body, resp, now); retryAfter > cooldown {
+		cooldown = retryAfter
+	}
+	if cooldown > auth.TransientRateLimitBackoffMax {
+		cooldown = auth.TransientRateLimitBackoffMax
+	}
+	return codex429Decision{
+		Scope:    rateLimitScopeAccount,
+		Reason:   "rate_limited",
+		ResetAt:  now.Add(cooldown),
+		Cooldown: cooldown,
+	}
+}
+
+func transient429RetryAfter(body []byte, resp *http.Response, now time.Time) time.Duration {
+	if resp != nil {
+		if retryAfter := parseRetryAfterHeader(resp.Header.Get("Retry-After")); retryAfter > 0 {
+			return retryAfter
+		}
+	}
+	if resetAt, ok := parseRetryAfterResetAt(body, now); ok {
+		if remaining := resetAt.Sub(now); remaining > 0 {
+			return remaining
+		}
+	}
+	return 0
 }
 
 func usageLimitFallbackCooldown(account *auth.Account, body []byte) time.Duration {
@@ -8162,6 +8199,14 @@ func Apply429Cooldown(store *auth.Store, account *auth.Account, body []byte, res
 	}
 	if account.IsPremium5hPlan() && decision.Scope == rateLimitScopeAccount && decision.Reason == "rate_limited_5h" {
 		store.MarkResponsesPremium5hRateLimited(account, decision.ResetAt)
+		return decision
+	}
+	if decision.Scope == rateLimitScopeAccount && decision.Reason == "rate_limited" {
+		applied := store.MarkTransientRateLimited(account, decision.Cooldown)
+		decision.Cooldown = applied
+		if applied > 0 {
+			decision.ResetAt = time.Now().Add(applied)
+		}
 		return decision
 	}
 	store.MarkResponsesRateLimited(account, decision.Cooldown)
