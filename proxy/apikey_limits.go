@@ -5,8 +5,8 @@
 //
 // 7 类限制:
 //   - ModelAllow / ModelDeny: O(1) string set,本机内存即可,无副作用。
-//   - RPM:  滑动 60s 内请求数。Redis INCR + EXPIRE 60s 计数器(没 Redis 时回退 DB 聚合 + 短缓存)。
-//   - RPD:  滑动 24h 内请求数。同上,EXPIRE 86400。
+//   - RPM:  滑动 60s 内请求数，DB 聚合 + Redis/Memory 60s 缓存。
+//   - RPD:  滑动 24h 内请求数，同上。
 //   - CostLimit5h / CostLimit7d:    滑动 5h / 7d 内 user_billed 累计。Redis 60s 缓存 + DB 聚合兜底。
 //   - TokenLimit5h / TokenLimit7d:  同 cost,聚合 total_tokens。
 //   - CostLimitDaily / TokenLimitDaily: 自然日(本地时区)累计,零点清零。缓存 key 带日期戳,
@@ -157,6 +157,11 @@ func (h *Handler) enforceAPIKeyLimits(c *gin.Context, model string) (int, string
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Second)
 	defer cancel()
 
+	var dayStart time.Time
+	if limits.CostLimitDaily > 0 || limits.TokenLimitDaily > 0 {
+		dayStart = database.StartOfDay(time.Now())
+	}
+	ctx = h.withAPIKeyLimitBatch(ctx, row, dayStart)
 	// 2. RPM
 	if limits.RPM > 0 {
 		count, err := h.apiKeyWindowRequests(ctx, row.ID, "rpm", apiKeyRPMWindow)
@@ -178,7 +183,6 @@ func (h *Handler) enforceAPIKeyLimits(c *gin.Context, model string) (int, string
 	// 4. 自然日 cost / token (issue #460)。固定窗口:服务器本地时区零点清零,
 	// 与下面的滑动窗口不同,到点全额恢复,报错文案带重置时刻。
 	if limits.CostLimitDaily > 0 || limits.TokenLimitDaily > 0 {
-		dayStart := database.StartOfDay(time.Now())
 		usage, err := h.apiKeyDailyUsage(ctx, row.ID, dayStart)
 		if err == nil && usage != nil {
 			resetAt := dayStart.AddDate(0, 0, 1).Format(time.RFC3339)
@@ -441,8 +445,8 @@ func (h *Handler) readAPIKeyLimitCache(ctx context.Context, key string) (*databa
 	if h == nil || h.cache == nil {
 		return nil, false
 	}
-	raw, ok, err := h.cache.GetRuntime(ctx, apiKeyLimitsCacheNamespace, key)
-	if err != nil || !ok || len(raw) == 0 {
+	raw := h.apiKeyLimitPayload(ctx, key)
+	if len(raw) == 0 {
 		return nil, false
 	}
 	var usage database.APIKeyWindowUsage

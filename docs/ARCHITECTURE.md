@@ -505,30 +505,20 @@ CREATE TABLE account_events (
 
 ### 缓存策略
 
-```go
-// Redis 缓存结构
-const (
-    // 限流计数器
-    KeyRateLimit = "ratelimit:{window}"
+| 数据 | 缓存策略 |
+| --- | --- |
+| 无访问约束的 API Key 元数据 | `api-key` 运行态缓存，TTL 5 分钟；管理端变更时删除 |
+| API Key 请求数、费用、Token 窗口统计 | 数据库聚合后写入 `api-key-limits`，TTL 60 秒；多个窗口批量读取 |
+| Key × 账号的共享用量增量 | `api-key-scope-delta` 分钟桶，TTL 5 分钟；最近三个桶共用 5 秒本地读取快照 |
+| Access Token | 专用 Token 缓存；写入 TTL 根据凭证有效期确定 |
+| 会话亲和关系 | 本地绑定及共享缓存；受会话 TTL 和账号可用性控制 |
+| 账号、模型冷却 | 运行态缓存；TTL 与冷却结束时间对应 |
 
-    // 会话缓存
-    KeySession = "session:{session_id}"
+运行态 Redis key 使用命名空间和摘要构造，业务 key 不直接作为 Redis key 输出。API Key 的 RPM/RPD 当前读取用量聚合快照；严格模型周预算由数据库事务和请求幂等记录控制。
 
-    // 用量统计缓存
-    KeyUsageStats = "usage:stats:{date}"
+API Key 运行态读取提供两个可选批量接口：`RuntimeBatchReader` 用于 JSON 窗口快照（Redis `MGET`），`RuntimeCounterBatchReader` 用于共享用量哈希（Redis Pipeline `HGETALL`）。每个 Redis 批次最多 128 个键；旧 `TokenCache` 适配器可以继续使用逐项读取。Memory 驱动在锁内复制快照，调用方不会拿到可修改底层缓存的引用。
 
-    // 账号 Token 缓存
-    KeyAccessToken = "token:{account_id}"
-)
-
-// 缓存 TTL
-type CacheTTL struct {
-    RateLimit    time.Duration = 1 * time.Minute
-    Session      time.Duration = 1 * time.Hour
-    UsageStats   time.Duration = 5 * time.Minute
-    AccessToken  time.Duration = 30 * time.Minute
-}
-```
+鉴权的 `singleflight` 只合并进行中的相同 Key 查询，并给共享结果的调用方复制可变字段；完成后不保留结果，不引入新的鉴权失效窗口。分组/账号预算使用独立的回源合并，同一批读取不因首个调用者取消而中断其他请求；共享读取仍有两秒上限。后台共享增量写入限制为 16 个槽位，饱和时同步回退。
 
 #### Responses 上下文缓存
 

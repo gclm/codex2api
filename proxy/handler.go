@@ -31,6 +31,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
+	"golang.org/x/sync/singleflight"
 )
 
 const consoleUpstreamErrorLogMaxBytes = 4 * 1024
@@ -53,18 +54,21 @@ func upstreamErrorConsoleBody(body []byte) string {
 
 // Handler API 路由处理器
 type Handler struct {
-	store        *auth.Store
-	configKeys   map[string]bool // 配置文件中的静态 key
-	db           *database.DB
-	cfg          *config.Config       // 全局配置
-	deviceCfg    *DeviceProfileConfig // 设备指纹配置
-	cache        cache.TokenCache     // Redis/Memory 运行态缓存
-	apiKeyGateMu sync.Mutex
-	promptRiskMu sync.Mutex
-	apiKeyGate   *apiKeyConcurrencyLimiter
-	scopeUsageMu sync.Mutex
-	scopeUsage   *apiKeyScopeUsageTracker
-	liveStore    *liveCallStore
+	store           *auth.Store
+	configKeys      map[string]bool // 配置文件中的静态 key
+	db              *database.DB
+	cfg             *config.Config       // 全局配置
+	deviceCfg       *DeviceProfileConfig // 设备指纹配置
+	cache           cache.TokenCache     // Redis/Memory 运行态缓存
+	apiKeyLookups   singleflight.Group
+	apiKeyGateMu    sync.Mutex
+	promptRiskMu    sync.Mutex
+	apiKeyGate      *apiKeyConcurrencyLimiter
+	scopeUsageMu    sync.Mutex
+	scopeUsage      *apiKeyScopeUsageTracker
+	scopeDeltaInit  sync.Once
+	scopeDeltaSlots chan struct{}
+	liveStore       *liveCallStore
 	// Responses WebSocket 同作用域会话的本机抢占注册表；跨实例所有权由 runtime cache 协调。
 	responsesWSSessionPreemptions responsesWSSessionPreemptRegistry
 	// 指纹重放冷却的存在性闸门缓存(见 hasActiveFingerprintReplayLocks)。
@@ -1218,7 +1222,7 @@ func NewHandlerWithDeviceProfile(store *auth.Store, db *database.DB, deviceCfg *
 //
 // 关键：绝不能把"数据库连接耗尽/超时"这类暂时性故障当成"客户端 key 无效"
 // 返回 401，否则压测或 DB 抖动时客户端会误以为自己的凭证失效（issue #323）。
-func (h *Handler) resolveAPIKey(key string) (*database.APIKeyRow, bool, error) {
+func (h *Handler) resolveAPIKeyUnshared(key string) (*database.APIKeyRow, bool, error) {
 	key = strings.TrimSpace(key)
 	if key == "" {
 		return nil, false, nil
