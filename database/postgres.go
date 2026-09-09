@@ -198,8 +198,9 @@ type sqlExecer interface {
 
 // DB PostgreSQL 数据库操作
 type DB struct {
-	conn   *sql.DB
-	driver string
+	conn           *sql.DB
+	driver         string
+	authCacheScope string
 
 	promptFilterAudit *promptFilterAuditQueue
 
@@ -419,6 +420,7 @@ func New(driver string, dsn string, schema ...string) (*DB, error) {
 	if db.isSQLite() {
 		db.sqliteWriteSem = make(chan struct{}, 1)
 	}
+	db.authCacheScope = apiKeyAuthDatabaseScope(driver, dsn, pgSchema)
 	db.SetUsageLogConfig(defaultUsageLogMode, defaultUsageLogBatchSize, defaultUsageLogFlushIntervalSeconds)
 	if db.isSQLite() {
 		if err := db.configureSQLite(ctx); err != nil {
@@ -476,6 +478,11 @@ func New(driver string, dsn string, schema ...string) (*DB, error) {
 		return nil, fmt.Errorf("创建代理风险评分表失败: %w", err)
 	}
 
+	if err := db.ensureAPIKeyAuthCacheSchema(ctx); err != nil {
+		backgroundTaskCancel()
+		_ = conn.Close()
+		return nil, fmt.Errorf("初始化鉴权缓存修订表失败: %w", err)
+	}
 	// 启动批量写入后台协程
 	db.startLogFlusher()
 

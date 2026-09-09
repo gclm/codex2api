@@ -50,6 +50,7 @@ type Handler struct {
 	proxyRiskJobsMu   sync.RWMutex
 	proxyRiskJobs     map[string]*proxyRiskScoringJob
 	cache             cache.TokenCache
+	authCacheProxy    *proxy.Handler
 	db                *database.DB
 	cacheCfgStore     responseCacheSettingsStore
 	rateLimiter       *proxy.RateLimiter
@@ -898,6 +899,9 @@ func (h *Handler) deleteRuntimeCache(ctx context.Context, namespace, key string)
 }
 
 func (h *Handler) invalidateAPIKeyRuntimeCaches(ctx context.Context, apiKey string) {
+	if h.authCacheProxy != nil {
+		h.authCacheProxy.InvalidateAPIKeyAuthCache(ctx)
+	}
 	h.deleteRuntimeCache(ctx, adminAPIKeyCountNamespace, "all")
 	if strings.TrimSpace(apiKey) != "" {
 		h.deleteRuntimeCache(ctx, adminAPIKeyCacheNamespace, apiKey)
@@ -966,6 +970,9 @@ func parseUsageChannel(c *gin.Context) string {
 	}
 	return ""
 }
+
+// SetAPIKeyAuthCacheHandler connects management changes to proxy cache invalidation.
+func (h *Handler) SetAPIKeyAuthCacheHandler(handler *proxy.Handler) { h.authCacheProxy = handler }
 
 // NewHandler 创建管理后台处理器
 func NewHandler(store *auth.Store, db *database.DB, tc cache.TokenCache, rl *proxy.RateLimiter, adminSecretEnv string) *Handler {

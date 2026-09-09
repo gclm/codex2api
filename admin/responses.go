@@ -6,6 +6,7 @@ import (
 
 	"github.com/codex2api/auth"
 	"github.com/codex2api/database"
+	"github.com/codex2api/proxy"
 	"github.com/codex2api/security"
 	"github.com/gin-gonic/gin"
 )
@@ -139,21 +140,22 @@ type createAPIKeyResponse struct {
 }
 
 type opsOverviewResponse struct {
-	UpdatedAt      string                        `json:"updated_at"`
-	UptimeSeconds  int64                         `json:"uptime_seconds"`
-	DatabaseDriver string                        `json:"database_driver"`
-	DatabaseLabel  string                        `json:"database_label"`
-	CacheDriver    string                        `json:"cache_driver"`
-	CacheLabel     string                        `json:"cache_label"`
-	CPU            opsCPUResponse                `json:"cpu"`
-	Memory         opsMemoryResponse             `json:"memory"`
-	Runtime        opsRuntimeResponse            `json:"runtime"`
-	Requests       opsRequestsResponse           `json:"requests"`
-	Postgres       opsDatabaseResponse           `json:"postgres"`
-	Redis          opsRedisResponse              `json:"redis"`
-	Traffic        opsTrafficResponse            `json:"traffic"`
-	ResponseCache  opsResponseCache              `json:"response_cache"`
-	Scheduler      auth.SchedulerMetricsSnapshot `json:"scheduler"`
+	APIKeyAuthCache proxy.APIKeyAuthCacheStats    `json:"api_key_auth_cache"`
+	UpdatedAt       string                        `json:"updated_at"`
+	UptimeSeconds   int64                         `json:"uptime_seconds"`
+	DatabaseDriver  string                        `json:"database_driver"`
+	DatabaseLabel   string                        `json:"database_label"`
+	CacheDriver     string                        `json:"cache_driver"`
+	CacheLabel      string                        `json:"cache_label"`
+	CPU             opsCPUResponse                `json:"cpu"`
+	Memory          opsMemoryResponse             `json:"memory"`
+	Runtime         opsRuntimeResponse            `json:"runtime"`
+	Requests        opsRequestsResponse           `json:"requests"`
+	Postgres        opsDatabaseResponse           `json:"postgres"`
+	Redis           opsRedisResponse              `json:"redis"`
+	Traffic         opsTrafficResponse            `json:"traffic"`
+	ResponseCache   opsResponseCache              `json:"response_cache"`
+	Scheduler       auth.SchedulerMetricsSnapshot `json:"scheduler"`
 }
 
 type opsCPUResponse struct {

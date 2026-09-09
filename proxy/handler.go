@@ -61,6 +61,7 @@ type Handler struct {
 	deviceCfg       *DeviceProfileConfig // 设备指纹配置
 	cache           cache.TokenCache     // Redis/Memory 运行态缓存
 	apiKeyLookups   singleflight.Group
+	authCache       *apiKeyAuthCache
 	apiKeyGateMu    sync.Mutex
 	promptRiskMu    sync.Mutex
 	apiKeyGate      *apiKeyConcurrencyLimiter
@@ -1208,6 +1209,13 @@ func (h *Handler) SetRuntimeCache(tc cache.TokenCache) {
 		return
 	}
 	h.cache = tc
+	if h.authCache != nil {
+		h.authCache.close()
+		h.authCache = nil
+	}
+	if h.cfg != nil && h.cfg.APIKeyAuthCacheEnabled && h.db != nil {
+		h.authCache = newAPIKeyAuthCache(h.db, tc)
+	}
 }
 
 // NewHandlerWithDeviceProfile 创建处理器（带设备指纹配置）
@@ -1331,8 +1339,25 @@ func (h *Handler) isValidKey(key string) bool {
 
 // hasAnyKeys 检查是否配置了任何密钥
 func (h *Handler) hasAnyKeys() bool {
+	configured, err := h.hasAnyKeysWithError()
+	return err == nil && configured
+}
+
+func (h *Handler) hasAnyKeysWithError() (bool, error) {
 	if len(h.configKeys) > 0 {
-		return true
+		return true, nil
+	}
+	if h.authCache != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		for i := 0; i < 3; i++ {
+			state, _, err := h.authCache.revision(ctx)
+			if errors.Is(err, errAPIKeyAuthRetry) {
+				continue
+			}
+			return state.KeyCount > 0, err
+		}
+		return false, errAPIKeyAuthRetry
 	}
 	if h.cache != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
@@ -1343,19 +1368,19 @@ func (h *Handler) hasAnyKeys() bool {
 		} else if ok {
 			var record apiKeyCountRuntimeRecord
 			if err := json.Unmarshal(raw, &record); err == nil {
-				return record.Count > 0
+				return record.Count > 0, nil
 			}
 		}
 	}
 	if h.db == nil {
-		return false
+		return false, nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	count, err := h.db.CountAPIKeys(ctx)
 	if err != nil {
 		log.Printf("统计 API Key 数量失败: %v", err)
-		return false
+		return false, err
 	}
 	if h.cache != nil {
 		payload, _ := json.Marshal(apiKeyCountRuntimeRecord{Count: count})
@@ -1365,7 +1390,7 @@ func (h *Handler) hasAnyKeys() bool {
 		}
 		cacheCancel()
 	}
-	return count > 0
+	return count > 0, nil
 }
 
 // logUsage 记录请求日志（非阻塞，写入内存缓冲由后台批量 flush）
@@ -3043,7 +3068,13 @@ func (h *Handler) authMiddleware() gin.HandlerFunc {
 		attachWsAcquireAudit(c)
 		attachUpstreamTrace(c, h.store)
 		// 如果没有配置任何密钥
-		if !h.hasAnyKeys() {
+		hasKeys, presenceErr := h.hasAnyKeysWithError()
+		if presenceErr != nil {
+			api.SendError(c, api.ErrServiceUnavailable)
+			c.Abort()
+			return
+		}
+		if !hasKeys {
 			if allowAnonymous {
 				// 显式允许匿名访问（旧行为，仅在 CODEX_ALLOW_ANONYMOUS=true 时启用）
 				c.Next()
@@ -3072,7 +3103,7 @@ func (h *Handler) authMiddleware() gin.HandlerFunc {
 		authHeader = security.SanitizeInput(authHeader)
 
 		key := strings.TrimSpace(strings.TrimPrefix(authHeader, "Bearer "))
-		apiKeyRow, ok, resolveErr := h.resolveAPIKey(key)
+		apiKeyRow, ok, resolveErr := h.resolveAPIKeyContext(c.Request.Context(), key)
 		if resolveErr != nil {
 			// DB/基础设施暂时性故障：返回 503，不当成客户端 key 无效（issue #323）。
 			// 不记 AUTH_FAILED 审计日志，避免污染凭证攻击告警。
