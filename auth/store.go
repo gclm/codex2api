@@ -4148,7 +4148,7 @@ func (s *Store) fastSchedulerUpdate(acc *Account) {
 	if scheduler != nil {
 		scheduler.Update(acc)
 	}
-	s.notifySchedulerAvailability()
+	s.notifySchedulerAccountAvailability(acc, true)
 }
 
 func (s *Store) fastSchedulerRemove(dbID int64) {
@@ -5985,6 +5985,9 @@ func (s *Store) flushGrokRateLimitSnapshots() {
 // Stop 停止后台刷新
 func (s *Store) Stop() {
 	s.stopOnce.Do(func() {
+		if hub := s.availability.Load(); hub != nil {
+			hub.stop()
+		}
 		if s.backgroundCancel != nil {
 			s.backgroundCancel()
 		}
@@ -7421,36 +7424,46 @@ func (s *Store) hasContinuationCandidateWithDispatch(key string, apiKeyID int64,
 
 // WaitForSessionAvailableWithFilter waits for an account that satisfies the request-level filter.
 func (s *Store) WaitForSessionAvailableWithFilter(ctx context.Context, key string, timeout time.Duration, apiKeyID int64, exclude map[int64]bool, filter AccountFilter) (*Account, string) {
-	account, proxyURL, _ := s.waitForSessionAvailableWithFilter(ctx, key, timeout, apiKeyID, exclude, filter, false, DispatchPolicyStandard)
+	account, proxyURL, _, _ := s.waitForSessionAvailableWithFilter(ctx, key, timeout, apiKeyID, exclude, filter, false, DispatchPolicyStandard)
 	return account, proxyURL
 }
 
 func (s *Store) WaitForSessionAvailableWithDispatch(ctx context.Context, key string, timeout time.Duration, apiKeyID int64, exclude map[int64]bool, filter AccountFilter, policy DispatchPolicy) (*Account, string) {
-	account, proxyURL, _ := s.waitForSessionAvailableWithFilter(ctx, key, timeout, apiKeyID, exclude, filter, false, policy)
+	account, proxyURL, _, _ := s.waitForSessionAvailableWithFilter(ctx, key, timeout, apiKeyID, exclude, filter, false, policy)
 	return account, proxyURL
 }
 
 // WaitForSessionAvailableWithDispatchGuard is the binding-aware waiting path.
 // It preserves the capacity-spillover decision made by the successful retry.
 func (s *Store) WaitForSessionAvailableWithDispatchGuard(ctx context.Context, key string, timeout time.Duration, apiKeyID int64, exclude map[int64]bool, filter AccountFilter, policy DispatchPolicy) (*Account, string, SessionAffinityGuard) {
-	return s.waitForSessionAvailableWithFilter(ctx, key, timeout, apiKeyID, exclude, filter, false, policy)
+	account, proxyURL, guard, _ := s.waitForSessionAvailableWithFilter(ctx, key, timeout, apiKeyID, exclude, filter, false, policy)
+	return account, proxyURL, guard
 }
 
 // WaitForContinuationAvailableWithFilter waits for the account already bound
 // to a stateful continuation instead of falling through to another account.
 func (s *Store) WaitForContinuationAvailableWithFilter(ctx context.Context, key string, timeout time.Duration, apiKeyID int64, exclude map[int64]bool, filter AccountFilter) (*Account, string) {
-	account, proxyURL, _ := s.waitForSessionAvailableWithFilter(ctx, key, timeout, apiKeyID, exclude, filter, true, DispatchPolicyStandard)
+	account, proxyURL, _, _ := s.waitForSessionAvailableWithFilter(ctx, key, timeout, apiKeyID, exclude, filter, true, DispatchPolicyStandard)
 	return account, proxyURL
 }
 
 func (s *Store) WaitForContinuationAvailableWithDispatch(ctx context.Context, key string, timeout time.Duration, apiKeyID int64, exclude map[int64]bool, filter AccountFilter, policy DispatchPolicy) (*Account, string) {
-	account, proxyURL, _ := s.waitForSessionAvailableWithFilter(ctx, key, timeout, apiKeyID, exclude, filter, true, policy)
+	account, proxyURL, _, _ := s.waitForSessionAvailableWithFilter(ctx, key, timeout, apiKeyID, exclude, filter, true, policy)
 	return account, proxyURL
 }
 
-func (s *Store) waitForSessionAvailableWithFilter(ctx context.Context, key string, timeout time.Duration, apiKeyID int64, exclude map[int64]bool, filter AccountFilter, preserveBinding bool, policy DispatchPolicy) (*Account, string, SessionAffinityGuard) {
+// WaitForDispatchAvailable exposes queue admission failures to protocol handlers.
+// preserveBinding retains the same account-only semantics as continuation waits.
+func (s *Store) WaitForDispatchAvailable(ctx context.Context, key string, timeout time.Duration, apiKeyID int64, exclude map[int64]bool, filter AccountFilter, preserveBinding bool, policy DispatchPolicy, heartbeat ...SchedulerWaitHeartbeat) (*Account, string, SessionAffinityGuard, error) {
+	return s.waitForSessionAvailableWithFilter(ctx, key, timeout, apiKeyID, exclude, filter, preserveBinding, policy, heartbeat...)
+}
+
+func (s *Store) waitForSessionAvailableWithFilter(ctx context.Context, key string, timeout time.Duration, apiKeyID int64, exclude map[int64]bool, filter AccountFilter, preserveBinding bool, policy DispatchPolicy, heartbeat ...SchedulerWaitHeartbeat) (*Account, string, SessionAffinityGuard, error) {
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	if timeout <= 0 || ctx.Err() != nil {
+		return nil, "", SessionAffinityGuard{}, ctx.Err()
 	}
 	hasCandidate := func() bool {
 		if preserveBinding {
@@ -7458,38 +7471,93 @@ func (s *Store) waitForSessionAvailableWithFilter(ctx context.Context, key strin
 		}
 		return s.hasDispatchCandidateWithDispatch(apiKeyID, exclude, filter, policy)
 	}
-	// Legacy keeps its immediate "no eligible pool" response. Indexed/shadow
-	// engines rely on durable outbox notifications, so they register a waiter
-	// even when the current snapshot is empty; an account created by another
-	// replica can then wake the request without database polling.
+	// Indexed/shadow also wait on an empty snapshot: another replica may add
+	// an account and notify this process through the durable outbox.
 	if s.SchedulerEngine() == "legacy" && !hasCandidate() {
-		return nil, "", SessionAffinityGuard{}
+		return nil, "", SessionAffinityGuard{}, nil
 	}
-	if timeout <= 0 {
-		return nil, "", SessionAffinityGuard{}
+	bindingKey := strings.TrimSpace(key)
+	boundAccountID := func() int64 {
+		if !preserveBinding || bindingKey == "" {
+			return 0
+		}
+		// This is only a wakeup hint. Do not add Redis reads to a blocked
+		// continuation: selection still enforces cached owners when no local
+		// binding is known, and an unknown hint accepts any notification.
+		s.sessionMu.RLock()
+		binding, ok := s.sessionBindings[bindingKey]
+		s.sessionMu.RUnlock()
+		if ok && binding.expiresAt.After(time.Now()) {
+			return binding.accountID
+		}
+		return 0
 	}
-
-	metrics := s.schedulerMetrics
 	hub := s.schedulerAvailabilityHub()
-	releaseWaiter := hub.addWaiter()
-	defer releaseWaiter()
+	waiter, err := hub.join(apiKeyID, boundAccountID(), exclude)
+	metrics := s.schedulerMetrics
+	if err != nil {
+		if metrics != nil && errors.Is(err, ErrSchedulerQueueFull) {
+			metrics.waitRejected.Add(1)
+			if errors.Is(err, ErrSchedulerKeyQueueFull) {
+				metrics.waitRejectedPerKey.Add(1)
+			}
+		}
+		return nil, "", SessionAffinityGuard{}, err
+	}
+	defer hub.finish(waiter, false, true, 0)
 	if metrics != nil {
 		metrics.waitStarted.Add(1)
 		metrics.waiters.Add(1)
-		defer metrics.waiters.Add(-1)
+		started := time.Now()
+		defer func() {
+			metrics.waiters.Add(-1)
+			metrics.recordWaitDuration(time.Since(started))
+		}()
 	}
-
 	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
-	// 兜底重试:冷却/限流纯时间到期不产生任何事件,只靠 hub 唤醒会睡满整个
-	// 超时。每秒醒一次的代价远低于旧轮询(50-500ms),又保证时间性恢复可见。
-	recheck := time.NewTicker(time.Second)
-	defer recheck.Stop()
-
+	expires := time.Now().Add(timeout)
+	var heartbeatTimer *time.Timer
+	var heartbeatC <-chan time.Time
+	defer func() {
+		if heartbeatTimer != nil {
+			heartbeatTimer.Stop()
+		}
+	}()
+	resetHeartbeat := func() error {
+		if len(heartbeat) == 0 || heartbeat[0] == nil {
+			return nil
+		}
+		delay, err := heartbeat[0]()
+		if err != nil {
+			return err
+		}
+		if delay <= 0 {
+			delay = time.Millisecond
+		}
+		if heartbeatTimer == nil {
+			heartbeatTimer = time.NewTimer(delay)
+			heartbeatC = heartbeatTimer.C
+		} else {
+			heartbeatTimer.Reset(delay)
+		}
+		return nil
+	}
 	for {
-		// Subscribe before selection so a concurrent Release cannot be lost
-		// between a failed CAS and entering the blocking select below.
-		changed, _ := hub.subscribe()
+		// Check both before and after admission. Cancellation must never leak
+		// an acquired slot, including when ready and Done fire together.
+		if ctx.Err() != nil {
+			if metrics != nil {
+				metrics.waitCanceled.Add(1)
+			}
+			return nil, "", SessionAffinityGuard{}, ctx.Err()
+		}
+		if !time.Now().Before(expires) {
+			if metrics != nil {
+				metrics.waitTimeouts.Add(1)
+			}
+			return nil, "", SessionAffinityGuard{}, nil
+		}
 		var acc *Account
 		var proxyURL string
 		var guard SessionAffinityGuard
@@ -7499,30 +7567,57 @@ func (s *Store) waitForSessionAvailableWithFilter(ctx context.Context, key strin
 			acc, proxyURL, guard = s.NextForSessionWithDispatchGuard(key, apiKeyID, exclude, filter, policy)
 		}
 		if acc != nil {
-			return acc, proxyURL, guard
+			if ctx.Err() != nil || !time.Now().Before(expires) {
+				s.Release(acc)
+				if metrics != nil {
+					if ctx.Err() != nil {
+						metrics.waitCanceled.Add(1)
+					} else {
+						metrics.waitTimeouts.Add(1)
+					}
+				}
+				return nil, "", SessionAffinityGuard{}, ctx.Err()
+			}
+			hub.finish(waiter, true, true, 0)
+			if metrics != nil {
+				metrics.waitGranted.Add(1)
+			}
+			return acc, proxyURL, guard, nil
 		}
 		if s.SchedulerEngine() == "legacy" && !hasCandidate() {
-			return nil, "", SessionAffinityGuard{}
+			return nil, "", SessionAffinityGuard{}, nil
 		}
-
-		select {
-		case <-changed:
-			if metrics != nil {
-				metrics.waitWakeups.Add(1)
+		hub.finish(waiter, false, false, boundAccountID())
+		if heartbeatTimer == nil {
+			if err := resetHeartbeat(); err != nil {
+				return nil, "", SessionAffinityGuard{}, err
 			}
-			continue
-		case <-recheck.C:
-			continue
-		case <-ctx.Done():
-			if metrics != nil {
-				metrics.waitCanceled.Add(1)
+		}
+	waitLoop:
+		for {
+			select {
+			case <-heartbeatC:
+				if err := resetHeartbeat(); err != nil {
+					return nil, "", SessionAffinityGuard{}, err
+				}
+			case <-waiter.ready:
+				if metrics != nil {
+					metrics.waitWakeups.Add(1)
+				}
+				break waitLoop
+			case <-ctx.Done():
+				if metrics != nil {
+					metrics.waitCanceled.Add(1)
+				}
+				return nil, "", SessionAffinityGuard{}, ctx.Err()
+			case <-deadline.C:
+				if metrics != nil {
+					metrics.waitTimeouts.Add(1)
+				}
+				return nil, "", SessionAffinityGuard{}, nil
+			case <-hub.done:
+				return nil, "", SessionAffinityGuard{}, context.Canceled
 			}
-			return nil, "", SessionAffinityGuard{}
-		case <-deadline.C:
-			if metrics != nil {
-				metrics.waitTimeouts.Add(1)
-			}
-			return nil, "", SessionAffinityGuard{}
 		}
 	}
 }
@@ -7666,7 +7761,7 @@ func (s *Store) expireSessionSlot(acc *Account, sessionKey string, reservationID
 	s.sessionMu.Unlock()
 	if released {
 		atomicDecrementIfPositive(&acc.OccupiedRequests)
-		s.notifySchedulerAvailability()
+		s.notifySchedulerAccountAvailability(acc, false)
 	}
 }
 
@@ -7700,7 +7795,7 @@ func (s *Store) tryReclaimSessionSlot(acc *Account, sessionKey string, updateSch
 	}
 	if accountDispatchBlocked(acc) {
 		if releaseOccupiedAccountSlot(acc) {
-			s.notifySchedulerAvailability()
+			s.notifySchedulerAccountAvailability(acc, false)
 		}
 		return false
 	}
@@ -7709,7 +7804,7 @@ func (s *Store) tryReclaimSessionSlot(acc *Account, sessionKey string, updateSch
 	dispatchReservation := acc.reserveDispatchCount(now)
 	if !dispatchReservation.Allowed {
 		if releaseOccupiedAccountSlot(acc) {
-			s.notifySchedulerAvailability()
+			s.notifySchedulerAccountAvailability(acc, false)
 		}
 		s.markDispatchCountLimitCooldown(acc, dispatchReservation.ResetAt, updateSchedulerOnLimit)
 		return false
@@ -7729,7 +7824,7 @@ func (s *Store) Release(acc *Account) {
 		return
 	}
 	if releaseOccupiedAccountSlot(acc) {
-		s.notifySchedulerAvailability()
+		s.notifySchedulerAccountAvailability(acc, false)
 	}
 }
 

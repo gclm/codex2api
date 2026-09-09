@@ -332,6 +332,7 @@ func main() {
 
 	// 5. 初始化账号管理器
 	store := auth.NewStore(db, tc, settings)
+	store.SetSchedulerWaitLimits(cfg.SchedulerMaxWaiters, cfg.SchedulerMaxWaitersPerKey)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	if err := store.Init(ctx); err != nil {

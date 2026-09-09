@@ -49,6 +49,8 @@ Codex2API 采用三层配置架构：
 | `ADMIN_SECRET` | 否 | - | 管理后台登录密钥 |
 | `CODEX_ALLOW_ANONYMOUS` | 否 | `false` | 设为 `true` 时，未配置任何对外 API Key 也允许 `/v1/*` 直接调用（仅限内网测试场景） |
 | `CODEX_SCHEDULER_ENGINE` | 否 | 空 | 调度引擎强制值：`legacy` / `shadow` / `indexed`。设置后优先于数据库配置，适合容器级灰度或紧急回退 |
+| `CODEX_SCHEDULER_MAX_WAITERS` | 否 | `4096` | 本实例账号调度等待请求总上限，正整数，重启生效。队列满立即返回可重试的 503 |
+| `CODEX_SCHEDULER_MAX_WAITERS_PER_KEY` | 否 | `256` | 本实例每个 API Key 的调度等待上限，正整数，重启生效；匿名请求共用一个计数 |
 | `FAST_SCHEDULER_ENABLED` | 否 | `false` | 旧版兼容开关；未设置 `CODEX_SCHEDULER_ENGINE` 且数据库没有 `SchedulerEngine` 时，`true` 映射为 `indexed` |
 | `TZ` | 否 | UTC | 时区，如 `Asia/Shanghai` |
 
@@ -204,9 +206,15 @@ Redis 模式会把 response context 保存到共享后端。后端值在重建�
 
 索引选号的过滤器与准入回调在调度锁外执行，返回后重新检查候选代次、账号状态和并发；`Disabled` / `DispatchPaused` 同样阻止最终占位。已有会话绑定、容量借号保护和有状态续链的账号约束保持生效。
 
+账号满载时，等待队列同时受全局与单个 API Key 上限约束，所有使用该账号池等待路径的协议和上游共用预算。HTTP 队列溢出返回 `503` 和 `Retry-After: 1`；已提交的 SSE 输出对应协议的失败事件，WebSocket 返回错误帧并以 `1013` 关闭，文案提示 1 秒后重试。该本地过载不会进入持续重试的上游换号循环，也不会被误报为账号额度耗尽。已有等待者不因调低上限而被取消；环境变量不是跨实例配额，也不限制已经在上游执行的请求。
+
+队列内按 API Key 轮转，同一 Key 按可尝试请求的入队顺序唤醒。普通单槽释放只唤醒一个等待者；已有续链绑定和排除账号用于跳过不匹配的通知，剩余模型、分组和 scope 过滤仍在锁外执行，失败后把机会交给后续等待者。一轮通知最多尝试当前等待集合一次，同时最多有 8 个通知驱动的选号；密集释放合并为后续容量检查。公平性针对已排队的请求，不承诺绕过快路径新请求的全局先来先服务，也不保证不同过滤条件获得相同吞吐。SSE/WS 心跳不重新入队。每个有等待者的账号池只使用一个每秒恢复检查定时器，空队列自动停止；账号冷却自身的到期恢复通知仍然生效。
+
 Codex 瞬时账号限流按 `15s → 30s → 60s → 120s → 240s → 300s` 退避。同一冻结窗口的并发 429 只推进一次；较长的真实 `Retry-After` 可延长该窗口（上限 5 分钟），普通重复 429 不顺延截止时间。短时冻结同样阻止 Spark 调度，但普通模型的 5h/7d 配额耗尽仍不占用 Spark 独立配额。短冻结不写数据库、不主动触发 WHAM 探测，到期直接恢复本地索引。原生 Redis/Memory 缓存保留限流类型和退避级别，并原子合并截止时间；迟到的短冻结不能覆盖配额或鉴权冷却。滚动升级期间旧实例无法识别新分类，建议完成全部实例升级后再评估短冻结行为。
 
 运维 API 的 `scheduler` 指标新增 `fast_scanned_accounts`（实际候选检查数）、`fast_filter_checks`、`fast_acquire_failures`、`fast_lock_wait_ns` 和 `model_cooldown_cache_reads`。这些是本进程累计计数，宜取时间差计算每次选号成本；快路径命中不再代表没有扫描。`selection_duration_buckets` 为 `10us/100us/1ms/10ms/100ms/1s/+Inf` 累积直方图，覆盖与 `selection_total` 相同的普通/新会话选号，已有绑定的直接复用不计入该直方图。跨实例共享冷却与 outbox 不提供账号全局并发限制，并发名额仍由每个实例独立计数。
+
+等待队列还暴露 `max_waiters`、`max_waiters_per_key`、`waiters`、`wait_rejected`（全部队列拒绝）、`wait_rejected_per_key`（其中因单 Key 上限被拒绝的子集）、`wait_granted`、`wait_duration_ns`，以及 `10ms/100ms/1s/10s/30s/+Inf` 的 `wait_duration_buckets` 累积直方图。等待耗时统计包含成功、取消和超时，拒绝入队不计入；`wait_wakeups / wait_granted` 的增量比可辅助观察无效唤醒，不能当作上游吞吐指标。Docker 部署应将两个新环境变量传给应用容器；项目标准/SQLite compose 的 `env_file` 会读取 `.env`，2004 专用 compose 可用 `environment` 覆盖。
 
 启动会自动创建 `scheduler_outbox` 和 `maintenance_jobs` 及相应索引/触发器，PostgreSQL 与 SQLite 均无需手工迁移。多实例对账号、API Key、分组、代理和调度设置的变化按 outbox 水位增量重放；高频用量计数不会产生调度事件。环境变量 `CODEX_SCHEDULER_ENGINE` 一旦设置，会固定本实例引擎并覆盖管理后台值。
 
