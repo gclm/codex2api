@@ -21,6 +21,29 @@ func newProxyPremiumTestStore() *auth.Store {
 	})
 }
 
+func TestApply429CooldownRepeatedThrottleKeepsDeadlineAcrossModels(t *testing.T) {
+	store := newProxyPremiumTestStore()
+	defer store.Stop()
+	acc := &auth.Account{DBID: 1, AccessToken: "token", PlanType: "pro", Status: auth.StatusReady}
+	body := []byte(`{"error":{"type":"rate_limit_error"}}`)
+	Apply429Cooldown(store, acc, body, nil, "gpt-5.4")
+	_, firstDeadline := acc.GetCooldownSnapshot()
+	Apply429Cooldown(store, acc, body, nil, "gpt-5.6-luna")
+	_, secondDeadline := acc.GetCooldownSnapshot()
+	if !secondDeadline.Equal(firstDeadline) || acc.TransientRateLimitBackoff() != 1 {
+		t.Fatal("a concurrent bare 429 extended or escalated the same window")
+	}
+	if acc.SparkDispatchEligible() {
+		t.Fatal("Spark bypassed an account-wide transient throttle")
+	}
+	resp := &http.Response{Header: make(http.Header)}
+	resp.Header.Set("Retry-After", "120")
+	Apply429Cooldown(store, acc, body, resp, "gpt-5.4")
+	if remaining, ok := acc.TransientRateLimitRemaining(time.Now()); !ok || remaining < 119*time.Second {
+		t.Fatalf("longer Retry-After was not preserved: %v, %v", remaining, ok)
+	}
+}
+
 func TestApply429CooldownPremium5hWindowMarksRateLimited(t *testing.T) {
 	store := newProxyPremiumTestStore()
 	acc := &auth.Account{

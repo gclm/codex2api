@@ -1,11 +1,201 @@
 package auth
 
 import (
+	"context"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/codex2api/cache"
 	"github.com/codex2api/database"
 )
+
+type delayedTransientCooldownCache struct {
+	cache.TokenCache
+	entered, resume chan struct{}
+}
+
+func (c *delayedTransientCooldownCache) MergeRuntimeCooldown(ctx context.Context, namespace, key string, record cache.RuntimeCooldown) (cache.RuntimeCooldown, error) {
+	if record.Kind == cache.CooldownKindTransient {
+		close(c.entered)
+		<-c.resume
+	}
+	return c.TokenCache.(cache.RuntimeCooldownMerger).MergeRuntimeCooldown(ctx, namespace, key, record)
+}
+
+func TestTransientRateLimitDelayedPublicationCannotReplaceQuota(t *testing.T) {
+	c := &delayedTransientCooldownCache{TokenCache: cache.NewMemory(1), entered: make(chan struct{}), resume: make(chan struct{})}
+	defer c.Close()
+	acc := newFastSchedulerTestAccount(1, HealthTierHealthy, 100, 4)
+	s := &Store{accounts: []*Account{acc}, maxConcurrency: 4, tokenCache: c}
+	done := make(chan struct{})
+	go func() { s.MarkTransientRateLimited(acc, 0); close(done) }()
+	<-c.entered
+	s.MarkCooldown(acc, time.Hour, "usage_limit")
+	close(c.resume)
+	<-done
+	if acc.GetCooldownReason() != "usage_limit" {
+		t.Fatal("late local throttle replaced quota")
+	}
+	record, ok := s.getCachedAccountCooldown(acc.DBID)
+	if !ok || record.Reason != "usage_limit" || record.Kind == cache.CooldownKindTransient {
+		t.Fatalf("late shared throttle replaced quota: %+v", record)
+	}
+}
+
+func TestTransientRateLimitExpiryRestoresIndexWithoutProbe(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	acc := newFastSchedulerTestAccount(1, HealthTierHealthy, 100, 4)
+	other := newFastSchedulerTestAccount(2, HealthTierHealthy, 100, 4)
+	s := &Store{accounts: []*Account{acc, other}, maxConcurrency: 4, backgroundCtx: ctx}
+	s.rebuildAccountIndex()
+	s.SetSchedulerEngine("indexed")
+	s.MarkTransientRateLimited(acc, 0)
+	if acc.SparkDispatchEligible() {
+		t.Fatal("account-wide throttle allowed Spark dispatch")
+	}
+	scheduler := s.getFastScheduler()
+	scheduler.mu.RLock()
+	_, present := scheduler.positions[acc.DBID]
+	scheduler.mu.RUnlock()
+	if present {
+		t.Fatal("throttled account was not removed before recovery")
+	}
+	// Use a short deadline to exercise the same recovery callback without a
+	// 15-second unit test. The other ready account prevents miss repair.
+	acc.mu.Lock()
+	acc.CooldownUtil = time.Now().Add(30 * time.Millisecond)
+	acc.transientRateLimitUntil = acc.CooldownUtil
+	acc.armTransientRateLimitRecoveryLocked(s)
+	acc.mu.Unlock()
+	deadline := time.NewTimer(time.Second)
+	defer deadline.Stop()
+	tick := time.NewTicker(time.Millisecond)
+	defer tick.Stop()
+	for {
+		scheduler := s.getFastScheduler()
+		scheduler.mu.RLock()
+		_, exists := scheduler.positions[acc.DBID]
+		scheduler.mu.RUnlock()
+		if exists && acc.IsAvailable() {
+			return
+		}
+		select {
+		case <-tick.C:
+		case <-deadline.C:
+			t.Fatal("expired transient account was not restored to the index")
+		}
+	}
+}
+
+func TestTransientRateLimitConcurrentWindowOnlyEscalatesOnce(t *testing.T) {
+	for trial := 0; trial < 100; trial++ {
+		s := &Store{maxConcurrency: 4}
+		acc := newFastSchedulerTestAccount(1, HealthTierHealthy, 100, 4)
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		for i := 0; i < 32; i++ {
+			wg.Add(1)
+			go func() { defer wg.Done(); <-start; s.MarkTransientRateLimited(acc, 0) }()
+		}
+		close(start)
+		wg.Wait()
+		if level := acc.TransientRateLimitBackoff(); level != 1 {
+			t.Fatalf("trial %d: first window escalated to %d, want 1", trial, level)
+		}
+	}
+}
+
+func TestTransientRateLimitCappedHintStillAdvancesBackoff(t *testing.T) {
+	s := &Store{maxConcurrency: 4}
+	acc := newFastSchedulerTestAccount(1, HealthTierHealthy, 100, 4)
+	s.MarkTransientRateLimited(acc, TransientRateLimitBackoffMax)
+	if got := acc.TransientRateLimitBackoff(); got != 1 {
+		t.Fatalf("capped hint left backoff at %d, want 1", got)
+	}
+	acc.mu.Lock()
+	acc.CooldownUtil = time.Now().Add(-time.Second)
+	acc.mu.Unlock()
+	if got := s.MarkTransientRateLimited(acc, 0); got < 29*time.Second || got > 30*time.Second {
+		t.Fatalf("next window = %v, want 30s", got)
+	}
+}
+
+func TestTransientRateLimitSummaryRespectsSparkWindow(t *testing.T) {
+	acc := newFastSchedulerTestAccount(1, HealthTierHealthy, 100, 4)
+	acc.PlanType = "pro"
+	acc.UsagePercent5hValid, acc.UsagePercent5h = true, 100
+	acc.Reset5hAt = time.Now().Add(time.Hour)
+	s := &Store{accounts: []*Account{acc}, maxConcurrency: 4}
+	s.MarkTransientRateLimited(acc, 0)
+	if got := s.UsageLimitedCandidateSummary(0, nil, nil, DispatchPolicySpark); !got.TransientOnly {
+		t.Fatalf("main quota incorrectly classified Spark throttle: %+v", got)
+	}
+	if got := s.UsageLimitedCandidateSummary(0, nil, nil, DispatchPolicyStandard); got.TransientOnly {
+		t.Fatal("main-model exhaustion was classified as transient")
+	}
+	if got := s.MarkTransientRateLimited(acc, time.Minute); got < 59*time.Second {
+		t.Fatal("main usage snapshot prevented extending the transient window")
+	}
+	acc.mu.Lock()
+	acc.UsagePercentSparkValid, acc.UsagePercentSpark = true, 100
+	acc.ResetSparkAt = time.Now().Add(time.Hour)
+	acc.mu.Unlock()
+	if got := s.UsageLimitedCandidateSummary(0, nil, nil, DispatchPolicySpark); !got.Found || got.TransientOnly || got.RetryAfter != 0 {
+		t.Fatalf("Spark quota exhaustion was classified as transient: %+v", got)
+	}
+}
+
+func TestTransientRateLimitExtendsWindowForLaterRetryAfter(t *testing.T) {
+	s := &Store{maxConcurrency: 4}
+	acc := newFastSchedulerTestAccount(1, HealthTierHealthy, 100, 4)
+	s.MarkTransientRateLimited(acc, 0)
+	if got := s.MarkTransientRateLimited(acc, 2*time.Minute); got < 119*time.Second {
+		t.Fatalf("later Retry-After was lost: %v", got)
+	}
+	if got := acc.TransientRateLimitBackoff(); got != 1 {
+		t.Fatalf("extending the same window escalated to %d", got)
+	}
+}
+
+func TestTransientRateLimitCachePreservesClassification(t *testing.T) {
+	tokenCache := cache.NewMemory(1)
+	defer tokenCache.Close()
+	a := newFastSchedulerTestAccount(1, HealthTierHealthy, 100, 4)
+	b := newFastSchedulerTestAccount(1, HealthTierHealthy, 100, 4)
+	s1 := &Store{accounts: []*Account{a}, maxConcurrency: 4, tokenCache: tokenCache}
+	s2 := &Store{accounts: []*Account{b}, maxConcurrency: 4, tokenCache: tokenCache}
+	s1.MarkTransientRateLimited(a, 0)
+	if !s2.accountHasCachedCooldown(b) {
+		t.Fatal("shared cooldown missing")
+	}
+	for _, s := range []*Store{s1, s2} {
+		got := s.UsageLimitedCandidateSummary(0, nil, nil, DispatchPolicyStandard)
+		if !got.TransientOnly || got.RetryAfter <= 0 {
+			t.Fatalf("transient classification lost: %+v", got)
+		}
+	}
+	if b.TransientRateLimitBackoff() != a.TransientRateLimitBackoff() {
+		t.Fatal("cache did not preserve the backoff level")
+	}
+}
+
+func TestTransientRateLimitDoesNotArmUsageProbe(t *testing.T) {
+	s := &Store{maxConcurrency: 4, boundaryProbeWakeCh: make(chan struct{}, 1)}
+	acc := newFastSchedulerTestAccount(1, HealthTierHealthy, 100, 4)
+	s.MarkTransientRateLimited(acc, 0)
+	if _, ok := acc.nextProbeBoundary(time.Now()); ok || len(s.boundaryProbeWakeCh) != 0 {
+		t.Fatal("transient-only cooldown armed a WHAM probe")
+	}
+	acc.mu.Lock()
+	acc.UsagePercent7dValid = true
+	acc.Reset7dAt = time.Now().Add(time.Hour)
+	acc.mu.Unlock()
+	if got, ok := acc.nextProbeBoundary(time.Now()); !ok || !got.Equal(acc.Reset7dAt) {
+		t.Fatal("a real quota boundary was suppressed by transient cooldown")
+	}
+}
 
 func newTransientRateLimitTestStore() *Store {
 	return NewStore(nil, nil, &database.SystemSettings{

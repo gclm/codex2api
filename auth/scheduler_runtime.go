@@ -90,7 +90,13 @@ type schedulerRuntimeMetrics struct {
 	selectionSlowHit          atomic.Uint64
 	selectionMiss             atomic.Uint64
 	selectionDurationNS       atomic.Uint64
+	selectionDurationBuckets  [7]atomic.Uint64
 	slowScannedAccounts       atomic.Uint64
+	fastScannedAccounts       atomic.Uint64
+	fastFilterChecks          atomic.Uint64
+	fastAcquireFailures       atomic.Uint64
+	fastLockWaitNS            atomic.Uint64
+	modelCooldownCacheReads   atomic.Uint64
 	waitStarted               atomic.Uint64
 	waitWakeups               atomic.Uint64
 	waitTimeouts              atomic.Uint64
@@ -124,41 +130,47 @@ type schedulerRuntimeMetrics struct {
 // SchedulerMetricsSnapshot is safe to expose through the admin operations API.
 // All values are process-local and monotonic except Waiters and account count.
 type SchedulerMetricsSnapshot struct {
-	Engine                    string `json:"engine"`
-	SelectionTotal            uint64 `json:"selection_total"`
-	SelectionFastHit          uint64 `json:"selection_fast_hit"`
-	SelectionSlowHit          uint64 `json:"selection_slow_hit"`
-	SelectionMiss             uint64 `json:"selection_miss"`
-	SelectionDurationNS       uint64 `json:"selection_duration_ns"`
-	SlowScannedAccounts       uint64 `json:"slow_scanned_accounts"`
-	WaitStarted               uint64 `json:"wait_started"`
-	WaitWakeups               uint64 `json:"wait_wakeups"`
-	WaitTimeouts              uint64 `json:"wait_timeouts"`
-	WaitCanceled              uint64 `json:"wait_canceled"`
-	Waiters                   int64  `json:"waiters"`
-	AvailabilitySignals       uint64 `json:"availability_signals"`
-	SnapshotGeneration        uint64 `json:"snapshot_generation"`
-	SnapshotAccountCount      int64  `json:"snapshot_account_count"`
-	LastSnapshotAt            string `json:"last_snapshot_at"`
-	OutboxWatermark           int64  `json:"outbox_watermark"`
-	OutboxHighWatermark       int64  `json:"outbox_high_watermark"`
-	OutboxBacklog             int64  `json:"outbox_backlog"`
-	OutboxEvents              uint64 `json:"outbox_events"`
-	OutboxBatches             uint64 `json:"outbox_batches"`
-	OutboxErrors              uint64 `json:"outbox_errors"`
-	OutboxLagMS               int64  `json:"outbox_lag_ms"`
-	OutboxLastAppliedAt       string `json:"outbox_last_applied_at"`
-	RoutingCacheHits          uint64 `json:"routing_cache_hits"`
-	RoutingCacheMisses        uint64 `json:"routing_cache_misses"`
-	RoutingCacheBuilds        uint64 `json:"routing_cache_builds"`
-	RoutingCacheFallbacks     uint64 `json:"routing_cache_fallbacks"`
-	RoutingCacheInvalidations uint64 `json:"routing_cache_invalidations"`
-	RoutingCacheEvictions     uint64 `json:"routing_cache_evictions"`
-	RoutingCacheEntries       int64  `json:"routing_cache_entries"`
-	RoutingCacheAccounts      int64  `json:"routing_cache_accounts"`
-	ShadowChecks              uint64 `json:"shadow_checks"`
-	ShadowAgreements          uint64 `json:"shadow_agreements"`
-	ShadowMismatches          uint64 `json:"shadow_mismatches"`
+	Engine                    string            `json:"engine"`
+	SelectionTotal            uint64            `json:"selection_total"`
+	SelectionFastHit          uint64            `json:"selection_fast_hit"`
+	SelectionSlowHit          uint64            `json:"selection_slow_hit"`
+	SelectionMiss             uint64            `json:"selection_miss"`
+	SelectionDurationNS       uint64            `json:"selection_duration_ns"`
+	SelectionDurationBuckets  map[string]uint64 `json:"selection_duration_buckets"`
+	SlowScannedAccounts       uint64            `json:"slow_scanned_accounts"`
+	FastScannedAccounts       uint64            `json:"fast_scanned_accounts"`
+	FastFilterChecks          uint64            `json:"fast_filter_checks"`
+	FastAcquireFailures       uint64            `json:"fast_acquire_failures"`
+	FastLockWaitNS            uint64            `json:"fast_lock_wait_ns"`
+	ModelCooldownCacheReads   uint64            `json:"model_cooldown_cache_reads"`
+	WaitStarted               uint64            `json:"wait_started"`
+	WaitWakeups               uint64            `json:"wait_wakeups"`
+	WaitTimeouts              uint64            `json:"wait_timeouts"`
+	WaitCanceled              uint64            `json:"wait_canceled"`
+	Waiters                   int64             `json:"waiters"`
+	AvailabilitySignals       uint64            `json:"availability_signals"`
+	SnapshotGeneration        uint64            `json:"snapshot_generation"`
+	SnapshotAccountCount      int64             `json:"snapshot_account_count"`
+	LastSnapshotAt            string            `json:"last_snapshot_at"`
+	OutboxWatermark           int64             `json:"outbox_watermark"`
+	OutboxHighWatermark       int64             `json:"outbox_high_watermark"`
+	OutboxBacklog             int64             `json:"outbox_backlog"`
+	OutboxEvents              uint64            `json:"outbox_events"`
+	OutboxBatches             uint64            `json:"outbox_batches"`
+	OutboxErrors              uint64            `json:"outbox_errors"`
+	OutboxLagMS               int64             `json:"outbox_lag_ms"`
+	OutboxLastAppliedAt       string            `json:"outbox_last_applied_at"`
+	RoutingCacheHits          uint64            `json:"routing_cache_hits"`
+	RoutingCacheMisses        uint64            `json:"routing_cache_misses"`
+	RoutingCacheBuilds        uint64            `json:"routing_cache_builds"`
+	RoutingCacheFallbacks     uint64            `json:"routing_cache_fallbacks"`
+	RoutingCacheInvalidations uint64            `json:"routing_cache_invalidations"`
+	RoutingCacheEvictions     uint64            `json:"routing_cache_evictions"`
+	RoutingCacheEntries       int64             `json:"routing_cache_entries"`
+	RoutingCacheAccounts      int64             `json:"routing_cache_accounts"`
+	ShadowChecks              uint64            `json:"shadow_checks"`
+	ShadowAgreements          uint64            `json:"shadow_agreements"`
+	ShadowMismatches          uint64            `json:"shadow_mismatches"`
 }
 
 func newSchedulerRuntimeMetrics() *schedulerRuntimeMetrics {
@@ -190,7 +202,13 @@ func (m *schedulerRuntimeMetrics) snapshot(engine string) SchedulerMetricsSnapsh
 		SelectionSlowHit:          m.selectionSlowHit.Load(),
 		SelectionMiss:             m.selectionMiss.Load(),
 		SelectionDurationNS:       m.selectionDurationNS.Load(),
+		SelectionDurationBuckets:  m.durationBucketsSnapshot(),
 		SlowScannedAccounts:       m.slowScannedAccounts.Load(),
+		FastScannedAccounts:       m.fastScannedAccounts.Load(),
+		FastFilterChecks:          m.fastFilterChecks.Load(),
+		FastAcquireFailures:       m.fastAcquireFailures.Load(),
+		FastLockWaitNS:            m.fastLockWaitNS.Load(),
+		ModelCooldownCacheReads:   m.modelCooldownCacheReads.Load(),
 		WaitStarted:               m.waitStarted.Load(),
 		WaitWakeups:               m.waitWakeups.Load(),
 		WaitTimeouts:              m.waitTimeouts.Load(),
@@ -359,7 +377,16 @@ func (s *Store) recordSchedulerSelection(started time.Time, fast, slow, hit bool
 	}
 	m := s.schedulerMetrics
 	m.selectionTotal.Add(1)
-	m.selectionDurationNS.Add(uint64(time.Since(started)))
+	elapsed := time.Since(started)
+	m.selectionDurationNS.Add(uint64(elapsed))
+	bucket := len(schedulerDurationBounds)
+	for i, bound := range schedulerDurationBounds {
+		if elapsed <= bound {
+			bucket = i
+			break
+		}
+	}
+	m.selectionDurationBuckets[bucket].Add(1)
 	if fast && hit {
 		m.selectionFastHit.Add(1)
 	} else if slow && hit {
@@ -370,6 +397,24 @@ func (s *Store) recordSchedulerSelection(started time.Time, fast, slow, hit bool
 	if scanned > 0 {
 		m.slowScannedAccounts.Add(uint64(scanned))
 	}
+}
+
+var schedulerDurationBounds = [...]time.Duration{
+	10 * time.Microsecond, 100 * time.Microsecond, time.Millisecond,
+	10 * time.Millisecond, 100 * time.Millisecond, time.Second,
+}
+
+// Cumulative buckets describe the same selections as selection_total; bound
+// session hits do not pass through this metric. Units are part of each key.
+func (m *schedulerRuntimeMetrics) durationBucketsSnapshot() map[string]uint64 {
+	labels := [...]string{"10us", "100us", "1ms", "10ms", "100ms", "1s", "+Inf"}
+	result := make(map[string]uint64, len(labels))
+	var sum uint64
+	for i, label := range labels {
+		sum += m.selectionDurationBuckets[i].Load()
+		result[label] = sum
+	}
+	return result
 }
 
 const schedulerShadowSampleEvery = 64

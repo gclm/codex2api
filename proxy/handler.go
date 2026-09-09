@@ -8202,7 +8202,9 @@ func Apply429Cooldown(store *auth.Store, account *auth.Account, body []byte, res
 		return decision
 	}
 	if decision.Scope == rateLimitScopeAccount && decision.Reason == "rate_limited" {
-		applied := store.MarkTransientRateLimited(account, decision.Cooldown)
+		// Pass only an actual upstream hint. Reusing the synthetic 15s floor
+		// here would slide the same cooldown forward on every in-flight 429.
+		applied := store.MarkTransientRateLimited(account, transient429RetryAfter(body, resp, time.Now()))
 		decision.Cooldown = applied
 		if applied > 0 {
 			decision.ResetAt = time.Now().Add(applied)

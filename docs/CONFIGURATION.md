@@ -191,7 +191,7 @@ Redis 模式会把 response context 保存到共享后端。后端值在重建�
 | `CodexWSHideUpstreamErrors` | bool | true | - | WS 上游最终失败时向客户端隐藏原始错误，返回统一友好提示；原始错误仍记录在后台日志/用量记录 |
 | `CodexWSSilentRetryEnabled` | bool | true | - | WS 首包前遇到限流、额度耗尽、5xx、读取错误或超时时，静默换账号并重建上游 WS |
 | `CodexWSSilentMaxRetries` | int | 2 | 0-10 | WS 首包前静默重试上限；`0` 禁用该预算 |
-| `SchedulerMode` | string | `round_robin` | - | 调度模式：`round_robin`（轮询，按调度分权重排序）、`remaining_quota`（优先使用用量少的账号）或 `fill_first`（顺序耗尽：集中使用剩余额度最少的账号，耗尽/限流后切下一个）。同用量档（`round_robin` 则在同一优先级段内）优先选择实时占用更低的账号，避免突发并发堆到单号触发瞬时 429。 |
+| `SchedulerMode` | string | `round_robin` | - | 调度模式：`round_robin`（轮询，按调度分权重排序）、`remaining_quota`（优先使用用量少的账号）或 `fill_first`（顺序耗尽：集中使用剩余额度最少的账号，耗尽/限流后切下一个）。索引引擎在同一优先级和健康档位内按最多 8 个可用候选的窗口比较实时占用；配额模式仍优先比较用量。窗口被过滤或并发占满时继续补选，不保证全池绝对最小占用。 |
 | `AffinityMode` | string | `bounded` | - | 会话亲和：`bounded`（账号不健康或绑定空闲超过 10 分钟时重新挑号，活跃会话不轮换以保住上游 prompt cache）、`off`（每次重选）、`strict`（长期粘连） |
 
 调度优先级先决定账号层级，同一优先级内再比较健康档位、调度分和当前负载；会话亲和只负责复用已绑定账号。多个最终用户共享同一个 API Key 时，下游可传 `X-Codex2API-Affinity-Key`，值会先哈希且仅用于本地账号绑定，不会转发给上游。
@@ -201,6 +201,12 @@ Redis 模式会把 response context 保存到共享后端。后端值在重建�
 - `legacy` 保留原有全池扫描，作为无停机回退路径。
 - `shadow` 仍由 legacy 选号，每 64 次请求抽样一次索引可用性并在运维页展示一致/差异计数；它用于短时灰度，不建议长期承载全量流量。
 - `indexed` 使用分层内存索引、稀疏 API Key 路由子池和事件驱动等待。账号数增长时，稳态选号不再复制或扫描完整账号切片。
+
+索引选号的过滤器与准入回调在调度锁外执行，返回后重新检查候选代次、账号状态和并发；`Disabled` / `DispatchPaused` 同样阻止最终占位。已有会话绑定、容量借号保护和有状态续链的账号约束保持生效。
+
+Codex 瞬时账号限流按 `15s → 30s → 60s → 120s → 240s → 300s` 退避。同一冻结窗口的并发 429 只推进一次；较长的真实 `Retry-After` 可延长该窗口（上限 5 分钟），普通重复 429 不顺延截止时间。短时冻结同样阻止 Spark 调度，但普通模型的 5h/7d 配额耗尽仍不占用 Spark 独立配额。短冻结不写数据库、不主动触发 WHAM 探测，到期直接恢复本地索引。原生 Redis/Memory 缓存保留限流类型和退避级别，并原子合并截止时间；迟到的短冻结不能覆盖配额或鉴权冷却。滚动升级期间旧实例无法识别新分类，建议完成全部实例升级后再评估短冻结行为。
+
+运维 API 的 `scheduler` 指标新增 `fast_scanned_accounts`（实际候选检查数）、`fast_filter_checks`、`fast_acquire_failures`、`fast_lock_wait_ns` 和 `model_cooldown_cache_reads`。这些是本进程累计计数，宜取时间差计算每次选号成本；快路径命中不再代表没有扫描。`selection_duration_buckets` 为 `10us/100us/1ms/10ms/100ms/1s/+Inf` 累积直方图，覆盖与 `selection_total` 相同的普通/新会话选号，已有绑定的直接复用不计入该直方图。跨实例共享冷却与 outbox 不提供账号全局并发限制，并发名额仍由每个实例独立计数。
 
 启动会自动创建 `scheduler_outbox` 和 `maintenance_jobs` 及相应索引/触发器，PostgreSQL 与 SQLite 均无需手工迁移。多实例对账号、API Key、分组、代理和调度设置的变化按 outbox 水位增量重放；高频用量计数不会产生调度事件。环境变量 `CODEX_SCHEDULER_ENGINE` 一旦设置，会固定本实例引擎并覆盖管理后台值。
 

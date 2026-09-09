@@ -349,6 +349,7 @@ type Account struct {
 	// was created by MarkTransientRateLimited. A later quota cooldown moves
 	// CooldownUtil away from it, which is how the two are told apart.
 	transientRateLimitUntil time.Time
+	transientRateLimitTimer *time.Timer // at most one recovery timer per throttled account
 
 	// 滑动窗口成功率（最近 N 次请求）
 	RecentResults    [20]uint8 // 1=成功, 0=失败
@@ -1964,6 +1965,15 @@ func (a *Account) SetCooldownWithReason(duration time.Duration, reason string) {
 func (a *Account) SetCooldownUntil(until time.Time, reason string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	a.setCooldownUntilLocked(until, reason)
+}
+
+func (a *Account) setCooldownUntilLocked(until time.Time, reason string) {
+	a.transientRateLimitUntil = time.Time{}
+	if a.transientRateLimitTimer != nil {
+		a.transientRateLimitTimer.Stop()
+		a.transientRateLimitTimer = nil
+	}
 	a.Status = StatusCooldown
 	a.CooldownUtil = until
 	a.CooldownReason = reason
@@ -3131,7 +3141,7 @@ func (a *Account) nextProbeBoundary(now time.Time) (time.Time, bool) {
 	if a.UsagePercent7dValid && a.UsageUpdatedAt.Before(a.Reset7dAt) {
 		consider(a.Reset7dAt)
 	}
-	if a.Status == StatusCooldown && a.CooldownReason != "unauthorized" {
+	if a.Status == StatusCooldown && a.CooldownReason != "unauthorized" && !a.isTransientRateLimitCooldownLocked() {
 		consider(a.CooldownUtil)
 	}
 	if next.IsZero() {
@@ -3491,13 +3501,7 @@ const (
 	runtimeCooldownCacheTimeout   = 300 * time.Millisecond
 )
 
-type runtimeCooldownRecord struct {
-	Model        string    `json:"model,omitempty"`
-	Reason       string    `json:"reason"`
-	ResetAt      time.Time `json:"reset_at"`
-	UpdatedAt    time.Time `json:"updated_at,omitempty"`
-	BackoffLevel int       `json:"backoff_level,omitempty"`
-}
+type runtimeCooldownRecord = cache.RuntimeCooldown
 
 func sessionAffinityTTL() time.Duration {
 	raw := strings.TrimSpace(os.Getenv("CODEX_SESSION_AFFINITY_TTL"))
@@ -3566,27 +3570,40 @@ func (s *Store) setCachedAccountCooldown(accountID int64, reason string, resetAt
 	if normalizeCooldownReason(reason) != "unauthorized" {
 		s.WakeBoundaryProbe(resetAt)
 	}
-	if s == nil || s.tokenCache == nil || accountID == 0 {
-		return
-	}
-	ttl, ok := cooldownTTL(resetAt)
-	if !ok {
-		return
-	}
-	payload, err := json.Marshal(runtimeCooldownRecord{
-		Reason:    normalizeCooldownReason(reason),
-		ResetAt:   resetAt,
-		UpdatedAt: time.Now(),
+	s.cacheAccountCooldownRecord(accountID, runtimeCooldownRecord{
+		Reason: normalizeCooldownReason(reason), ResetAt: resetAt, UpdatedAt: time.Now(),
 	})
-	if err != nil {
-		log.Printf("[账号 %d] 序列化账号冷却缓存失败: %v", accountID, err)
-		return
+}
+
+// Publication is outside Account.mu and FastScheduler.mu. Native cache drivers
+// merge atomically; older/custom TokenCache implementations retain SetRuntime.
+func (s *Store) cacheAccountCooldownRecord(accountID int64, record runtimeCooldownRecord) runtimeCooldownRecord {
+	if s == nil || s.tokenCache == nil || accountID == 0 {
+		return record
+	}
+	ttl, ok := cooldownTTL(record.ResetAt)
+	if !ok {
+		return record
 	}
 	ctx, cancel := cooldownRuntimeContext()
 	defer cancel()
+	if merger, ok := s.tokenCache.(cache.RuntimeCooldownMerger); ok {
+		merged, err := merger.MergeRuntimeCooldown(ctx, accountCooldownCacheNamespace, accountCooldownRuntimeKey(accountID), record)
+		if err != nil {
+			log.Printf("[账号 %d] 合并账号冷却缓存失败: %v", accountID, err)
+			return record
+		}
+		return merged
+	}
+	payload, err := json.Marshal(record)
+	if err != nil {
+		log.Printf("[账号 %d] 序列化账号冷却缓存失败: %v", accountID, err)
+		return record
+	}
 	if err := s.tokenCache.SetRuntime(ctx, accountCooldownCacheNamespace, accountCooldownRuntimeKey(accountID), payload, ttl); err != nil {
 		log.Printf("[账号 %d] 写入账号冷却缓存失败: %v", accountID, err)
 	}
+	return record
 }
 
 func (s *Store) getCachedAccountCooldown(accountID int64) (runtimeCooldownRecord, bool) {
@@ -3645,10 +3662,35 @@ func (s *Store) applyCachedAccountCooldown(acc *Account, record runtimeCooldownR
 	reason := normalizeCooldownReason(record.Reason)
 	baseLimit := atomic.LoadInt64(&s.maxConcurrency)
 	acc.mu.Lock()
+	current := runtimeCooldownRecord{Reason: acc.CooldownReason, ResetAt: acc.CooldownUtil}
+	if acc.isTransientRateLimitCooldownLocked() {
+		current.Kind = cache.CooldownKindTransient
+	}
+	if record.Kind == cache.CooldownKindTransient && (acc.Status == StatusError || accountDispatchBlocked(acc) || acc.healthTierLocked() == HealthTierBanned) {
+		acc.mu.Unlock()
+		return
+	}
+	if acc.Status == StatusCooldown && current.ResetAt.After(time.Now()) &&
+		(current.Strength() > record.Strength() || current.Strength() == record.Strength() && current.ResetAt.After(record.ResetAt)) {
+		acc.mu.Unlock()
+		return
+	}
 	acc.Status = StatusCooldown
 	acc.CooldownUtil = record.ResetAt
 	acc.CooldownReason = reason
+	acc.transientRateLimitUntil = time.Time{}
+	if record.Kind == cache.CooldownKindTransient && reason == ResponsesRateLimitedCooldownReason {
+		acc.transientRateLimitUntil = record.ResetAt
+		acc.transientRateLimitBackoff = max(acc.transientRateLimitBackoff, record.BackoffLevel)
+		acc.armTransientRateLimitRecoveryLocked(s)
+	} else if acc.transientRateLimitTimer != nil {
+		acc.transientRateLimitTimer.Stop()
+		acc.transientRateLimitTimer = nil
+	}
 	now := time.Now()
+	if !record.UpdatedAt.IsZero() {
+		now = record.UpdatedAt
+	}
 	switch reason {
 	case "unauthorized":
 		acc.LastUnauthorizedAt = now
@@ -3734,6 +3776,9 @@ func (s *Store) getCachedModelCooldown(accountID int64, model string) (runtimeCo
 	}
 	ctx, cancel := cooldownRuntimeContext()
 	defer cancel()
+	if s.schedulerMetrics != nil {
+		s.schedulerMetrics.modelCooldownCacheReads.Add(1)
+	}
 	payload, ok, err := s.tokenCache.GetRuntime(ctx, modelCooldownCacheNamespace, modelCooldownRuntimeKey(accountID, key))
 	if err != nil {
 		log.Printf("[账号 %d] 读取模型冷却缓存失败 model=%s: %v", accountID, key, err)
@@ -4056,6 +4101,9 @@ func (s *Store) configureFastScheduler(scheduler *FastScheduler) {
 	if s == nil || scheduler == nil {
 		return
 	}
+	scheduler.mu.Lock()
+	scheduler.metrics = s.schedulerMetrics
+	scheduler.mu.Unlock()
 	scheduler.SetGroupCheck(s.APIKeyAllowsAccount)
 	scheduler.SetAcquireFunc(func(acc *Account, concurrencyLimit int64) bool {
 		return s.tryAcquireAccount(acc, concurrencyLimit, false)
@@ -5940,6 +5988,17 @@ func (s *Store) Stop() {
 		if s.backgroundCancel != nil {
 			s.backgroundCancel()
 		}
+		for _, acc := range s.accountSnapshotAccounts() {
+			if acc == nil {
+				continue
+			}
+			acc.mu.Lock()
+			if acc.transientRateLimitTimer != nil {
+				acc.transientRateLimitTimer.Stop()
+				acc.transientRateLimitTimer = nil
+			}
+			acc.mu.Unlock()
+		}
 		if s.stopCh != nil {
 			close(s.stopCh)
 		}
@@ -6093,13 +6152,20 @@ const (
 	accountAcquireFailureNone accountAcquireFailure = iota
 	accountAcquireFailureCapacity
 	accountAcquireFailureDispatchLimit
+	accountAcquireFailureUnavailable
 )
 
 func (s *Store) tryAcquireAccountWithFailure(acc *Account, limit int64, updateSchedulerOnLimit bool) (bool, accountAcquireFailure) {
 	if acc == nil || limit <= 0 {
 		return false, accountAcquireFailureDispatchLimit
 	}
+	if accountDispatchBlocked(acc) {
+		return false, accountAcquireFailureUnavailable
+	}
 	if !reserveOccupiedAccountSlot(acc, limit) {
+		if accountDispatchBlocked(acc) {
+			return false, accountAcquireFailureUnavailable
+		}
 		return false, accountAcquireFailureCapacity
 	}
 	now := time.Now()
@@ -6139,8 +6205,12 @@ func accountOccupiedRequests(acc *Account) int64 {
 	return occupied
 }
 
+func accountDispatchBlocked(acc *Account) bool {
+	return acc == nil || atomic.LoadInt32(&acc.Disabled) != 0 || atomic.LoadInt32(&acc.DispatchPaused) != 0
+}
+
 func reserveOccupiedAccountSlot(acc *Account, limit int64) bool {
-	if acc == nil || limit <= 0 {
+	if limit <= 0 || accountDispatchBlocked(acc) {
 		return false
 	}
 	for {
@@ -6150,6 +6220,10 @@ func reserveOccupiedAccountSlot(acc *Account, limit int64) bool {
 		}
 		if atomic.CompareAndSwapInt64(&acc.OccupiedRequests, occupied, occupied+1) {
 			atomic.AddInt64(&acc.ActiveRequests, 1)
+			if accountDispatchBlocked(acc) {
+				releaseOccupiedAccountSlot(acc)
+				return false
+			}
 			return true
 		}
 	}
@@ -7282,7 +7356,7 @@ func (s *Store) UsageLimitedCandidateSummary(apiKeyID int64, exclude map[int64]b
 			continue
 		}
 		summary.Found = true
-		if remaining, ok := acc.TransientRateLimitRemaining(now); ok {
+		if remaining, ok := acc.transientRateLimitRemainingForPolicy(now, policy); ok {
 			if summary.RetryAfter == 0 || remaining < summary.RetryAfter {
 				summary.RetryAfter = remaining
 			}
@@ -7597,7 +7671,7 @@ func (s *Store) expireSessionSlot(acc *Account, sessionKey string, reservationID
 }
 
 func (s *Store) tryReclaimSessionSlot(acc *Account, sessionKey string, updateSchedulerOnLimit bool) bool {
-	if s == nil || acc == nil || strings.TrimSpace(sessionKey) == "" || !s.SessionSlotBufferEnabled() || s.GetSessionSlotBuffer() <= 0 {
+	if s == nil || accountDispatchBlocked(acc) || strings.TrimSpace(sessionKey) == "" || !s.SessionSlotBufferEnabled() || s.GetSessionSlotBuffer() <= 0 {
 		return false
 	}
 	sessionKey = strings.TrimSpace(sessionKey)
@@ -7622,6 +7696,12 @@ func (s *Store) tryReclaimSessionSlot(acc *Account, sessionKey string, updateSch
 	}
 	s.sessionMu.Unlock()
 	if !reclaimed {
+		return false
+	}
+	if accountDispatchBlocked(acc) {
+		if releaseOccupiedAccountSlot(acc) {
+			s.notifySchedulerAvailability()
+		}
 		return false
 	}
 
@@ -9426,6 +9506,11 @@ func (s *Store) markCooldownUntil(acc *Account, until time.Time, reason string, 
 	acc.Status = StatusCooldown
 	acc.CooldownUtil = until
 	acc.CooldownReason = reason
+	acc.transientRateLimitUntil = time.Time{}
+	if acc.transientRateLimitTimer != nil {
+		acc.transientRateLimitTimer.Stop()
+		acc.transientRateLimitTimer = nil
+	}
 	switch reason {
 	case "unauthorized":
 		acc.LastUnauthorizedAt = now
@@ -9464,12 +9549,6 @@ func (s *Store) markCooldownUntil(acc *Account, until time.Time, reason string, 
 
 // markCooldown 根据 exactDuration 选择自适应或精确时长并应用账号冷却。
 func (s *Store) markCooldown(acc *Account, duration time.Duration, reason string, errorMsg string, exactDuration bool) {
-	s.markCooldownWithPersist(acc, duration, reason, errorMsg, exactDuration, true)
-}
-
-// markCooldownWithPersist 是 markCooldown 的底层实现；persist=false 时只更新内存、
-// 调度器与跨实例冷却缓存，不写 DB（秒级瞬时冷却重启即失效，落库没有意义）。
-func (s *Store) markCooldownWithPersist(acc *Account, duration time.Duration, reason string, errorMsg string, exactDuration bool, persist bool) {
 	if acc == nil {
 		return
 	}
@@ -9514,14 +9593,13 @@ func (s *Store) markCooldownWithPersist(acc *Account, duration time.Duration, re
 		acc.ErrorMsg = errorMsg
 	}
 	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
-	acc.mu.Unlock()
-
 	until := now.Add(duration)
-	acc.SetCooldownUntil(until, reason)
+	acc.setCooldownUntilLocked(until, reason)
+	acc.mu.Unlock()
 	s.fastSchedulerUpdate(acc)
 	s.setCachedAccountCooldown(acc.DBID, reason, until)
 
-	if s.db == nil || !persist {
+	if s.db == nil {
 		return
 	}
 
@@ -9874,6 +9952,10 @@ func (s *Store) ClearCooldown(acc *Account) {
 	acc.PermanentRefreshFailures = 0
 	acc.transientRateLimitBackoff = 0
 	acc.transientRateLimitUntil = time.Time{}
+	if acc.transientRateLimitTimer != nil {
+		acc.transientRateLimitTimer.Stop()
+		acc.transientRateLimitTimer = nil
+	}
 	if wasCooling && !premium5hLimited {
 		acc.HealthTier = HealthTierWarm
 	} else if wasError && acc.HealthTier != HealthTierBanned {

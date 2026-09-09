@@ -34,8 +34,8 @@ type fastSchedulerPosition struct {
 // 调度策略：调度优先级全局优先；同优先级内按健康层级分桶，
 // 桶内按调度分排序后 round-robin。
 // 验证过的账号只作为同分 tie-breaker，避免历史请求量盖过额度快重置优先级。
-// 取号时在同用量档（round_robin 则在整个优先级段）优先 OccupiedRequests
-// 最低的账号，把突发并发摊开，降低单号瞬时 429。
+// 取号时只比较一个固定大小候选窗口的占用；配额模式仍先比较用量。
+// 过滤和准入回调可能访问 Redis/DB，必须在调度锁外执行。
 //
 // fill_first 模式（issue #501）：同优先级内按 7d 用量降序排列并始终从队首
 // 取号，流量集中在剩余额度最少的账号上；该账号限流/耗尽后自然滑落到下一个，
@@ -54,6 +54,8 @@ type FastScheduler struct {
 	cursors    [3]atomic.Uint64
 	groupCheck func(apiKeyID int64, account *Account) bool
 	acquire    func(account *Account, concurrencyLimit int64) bool
+	generation uint64 // detects candidate invalidation while callbacks run without mu
+	metrics    *schedulerRuntimeMetrics
 	// retainUnavailable keeps dormant entries in sparse routing schedulers. The
 	// live Account snapshot still gates acquisition, but recovery no longer
 	// requires rebuilding every API-key sub-pool.
@@ -96,6 +98,7 @@ func (s *FastScheduler) SetGroupCheck(check func(apiKeyID int64, account *Accoun
 	}
 	s.mu.Lock()
 	s.groupCheck = check
+	s.generation++
 	s.mu.Unlock()
 }
 
@@ -105,6 +108,7 @@ func (s *FastScheduler) SetAcquireFunc(acquire func(account *Account, concurrenc
 	}
 	s.mu.Lock()
 	s.acquire = acquire
+	s.generation++
 	s.mu.Unlock()
 }
 
@@ -114,6 +118,7 @@ func (s *FastScheduler) SetRetainUnavailable(enabled bool) {
 	}
 	s.mu.Lock()
 	s.retainUnavailable = enabled
+	s.generation++
 	s.mu.Unlock()
 }
 
@@ -200,6 +205,7 @@ func (s *FastScheduler) entryLessLocked(tier AccountHealthTier, a, b *fastSchedu
 
 // sortBucketLocked 重排单个桶并重建其位置索引，清掉待重排标记。
 func (s *FastScheduler) sortBucketLocked(tier AccountHealthTier) {
+	s.generation++
 	entries := s.buckets[tier]
 	delete(s.unsorted, tier)
 	if len(entries) == 0 {
@@ -360,6 +366,7 @@ func (s *FastScheduler) updateLocked(acc *Account, now time.Time) {
 		return
 	}
 
+	previousPriority := entries[pos.index].priority
 	entries[pos.index] = fastSchedulerEntry{
 		acc:           acc,
 		dbID:          acc.DBID,
@@ -367,7 +374,11 @@ func (s *FastScheduler) updateLocked(acc *Account, now time.Time) {
 		proven:        proven,
 		priority:      acc.schedulerPriority(),
 	}
+	if previousPriority != entries[pos.index].priority {
+		s.generation++
+	}
 	if s.entryOutOfOrderLocked(tier, entries, pos.index) {
+		s.generation++
 		s.unsorted[tier] = true
 	}
 }
@@ -386,6 +397,7 @@ func (s *FastScheduler) entryOutOfOrderLocked(tier AccountHealthTier, entries []
 
 // appendLocked 把条目挂到桶尾并打上待重排标记，O(1)。
 func (s *FastScheduler) appendLocked(acc *Account, tier AccountHealthTier, dispatchScore float64, proven bool) {
+	s.generation++
 	entries := append(s.buckets[tier], fastSchedulerEntry{
 		acc:           acc,
 		dbID:          acc.DBID,
@@ -419,6 +431,7 @@ func (s *FastScheduler) SetBaseLimit(baseLimit int64) {
 	}
 	s.mu.Lock()
 	s.baseLimit = baseLimit
+	s.generation++
 	s.mu.Unlock()
 }
 
@@ -438,7 +451,7 @@ func (s *FastScheduler) AcquireExcludingWithFilter(apiKeyID int64, exclude map[i
 
 // AcquireExcludingWithDispatch 按用量策略选号。spark 请求不看账号级 5h/7d。
 func (s *FastScheduler) AcquireExcludingWithDispatch(apiKeyID int64, exclude map[int64]bool, filter AccountFilter, policy DispatchPolicy) *Account {
-	return s.acquireExcludingWithDispatch(apiKeyID, exclude, filter, policy, nil)
+	return s.acquireExcludingWithDispatch(apiKeyID, exclude, filter, policy, nil, false)
 }
 
 // AcquireForAffinityWithDispatch chooses a deterministic start offset inside
@@ -446,7 +459,7 @@ func (s *FastScheduler) AcquireExcludingWithDispatch(apiKeyID int64, exclude map
 // allocate and sort an O(N) candidate slice for every new session; normally it
 // inspects one entry and remains O(1) with respect to account-pool size.
 func (s *FastScheduler) AcquireForAffinityWithDispatch(affinityHash uint64, apiKeyID int64, exclude map[int64]bool, filter AccountFilter, policy DispatchPolicy) *Account {
-	return s.acquireExcludingWithDispatch(apiKeyID, exclude, filter, policy, &affinityHash)
+	return s.acquireExcludingWithDispatch(apiKeyID, exclude, filter, policy, &affinityHash, false)
 }
 
 // HasAvailableWithDispatch is a read-only shadow check. It deliberately
@@ -454,50 +467,44 @@ func (s *FastScheduler) AcquireForAffinityWithDispatch(affinityHash uint64, apiK
 // indexed and legacy round-robin cursors are independent and both choices can
 // be policy-correct.
 func (s *FastScheduler) HasAvailableWithDispatch(apiKeyID int64, exclude map[int64]bool, filter AccountFilter, policy DispatchPolicy) bool {
-	if s == nil {
-		return false
-	}
-	now := time.Now()
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	for _, tier := range fastSchedulerTierOrder {
-		for _, entry := range s.buckets[tier] {
-			if entry.acc == nil || exclude != nil && exclude[entry.dbID] {
-				continue
-			}
-			if !entry.acc.AllowsAPIKey(apiKeyID) || s.groupCheck != nil && !s.groupCheck(apiKeyID, entry.acc) {
-				continue
-			}
-			if filter != nil && !filter(entry.acc) {
-				continue
-			}
-			_, _, limit, _, available := entry.acc.fastSchedulerSnapshotForPolicy(s.baseLimit, now, policy)
-			if available && limit > 0 && accountOccupiedRequests(entry.acc) < limit {
-				return true
-			}
-		}
-	}
-	return false
+	return s.acquireExcludingWithDispatch(apiKeyID, exclude, filter, policy, nil, true) != nil
 }
 
-func (s *FastScheduler) acquireExcludingWithDispatch(apiKeyID int64, exclude map[int64]bool, filter AccountFilter, policy DispatchPolicy, affinityHash *uint64) *Account {
+// fastSchedulerCandidateWindow bounds load comparisons and stack storage. A
+// rejected window advances through the same priority/tier before falling back.
+const fastSchedulerCandidateWindow = 8
+const fastSchedulerMaxConcurrentRestarts = 16
+
+type fastSelectionStats struct {
+	scanned, filterChecks, acquireFailures, restarts int
+	lockWait                                         time.Duration
+}
+
+func (s *FastScheduler) acquireExcludingWithDispatch(apiKeyID int64, exclude map[int64]bool, filter AccountFilter, policy DispatchPolicy, affinityHash *uint64, inspectOnly bool) *Account {
 	if s == nil {
 		return nil
 	}
-
-	now := time.Now()
-
+	var stats fastSelectionStats
+	lockStarted := time.Now()
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	stats.lockWait = time.Since(lockStarted)
+	metrics := s.metrics
+	defer func() {
+		s.mu.Unlock()
+		if metrics != nil {
+			metrics.fastScannedAccounts.Add(uint64(stats.scanned))
+			metrics.fastFilterChecks.Add(uint64(stats.filterChecks))
+			metrics.fastAcquireFailures.Add(uint64(stats.acquireFailures))
+			metrics.fastLockWaitNS.Add(uint64(stats.lockWait))
+		}
+	}()
 
-	baseLimit := s.baseLimit
 	for {
-		// 写入侧只打标不排序，取号前在这里把被打乱的桶补排一次。
+		if stats.restarts >= fastSchedulerMaxConcurrentRestarts {
+			return nil
+		}
 		s.ensureSortedLocked()
 		changed := false
-		// 每个健康桶都已按 priority DESC 排序。用三路归并的方式逐级取全局
-		// 最高优先级，并在该优先级内按 healthy -> warm -> risky 扫描。
-		// 只有所有健康桶的当前优先级都不可用时，才会回落到下一优先级。
 		var segmentStarts [3]int
 	priorityLoop:
 		for {
@@ -511,33 +518,29 @@ func (s *FastScheduler) acquireExcludingWithDispatch(apiKeyID int64, exclude map
 				}
 				priority := bucket[start].priority
 				if !foundPriority || priority > nextPriority {
-					nextPriority = priority
-					foundPriority = true
+					nextPriority, foundPriority = priority, true
 				}
 			}
 			if !foundPriority {
 				break
 			}
-
 			for tierIdx, tier := range fastSchedulerTierOrder {
 				bucket := s.buckets[tier]
 				segStart := segmentStarts[tierIdx]
 				if segStart >= len(bucket) || bucket[segStart].priority != nextPriority {
 					continue
 				}
-				segEnd := segStart + 1
-				for segEnd < len(bucket) && bucket[segEnd].priority == nextPriority {
-					segEnd++
-				}
-
+				// Buckets are sorted by priority. Finding the segment boundary
+				// must not walk 50k equal-priority entries for every request.
+				segEnd := segStart + sort.Search(len(bucket)-segStart, func(i int) bool {
+					return bucket[segStart+i].priority < nextPriority
+				})
 				cursor := &s.cursors[tierIdx]
 				var zeroCursor atomic.Uint64
-				// remaining_quota / fill_first 不走轮询游标：每次都从排序后的
-				// 队首开始扫，保证严格按排序语义取号。
-				if s.schedulerMode == "remaining_quota" || s.schedulerMode == "fill_first" {
+				if inspectOnly || s.schedulerMode == "remaining_quota" || s.schedulerMode == "fill_first" {
 					cursor = &zeroCursor
 				}
-				acc, stale := s.scanRangeLocked(tier, segStart, segEnd, cursor, affinityHash, baseLimit, now, apiKeyID, exclude, filter, policy)
+				acc, stale := s.scanRangeLocked(tier, segStart, segEnd, cursor, affinityHash, apiKeyID, exclude, filter, policy, inspectOnly, &stats)
 				if acc != nil {
 					return acc
 				}
@@ -558,107 +561,156 @@ type fastSchedulerCandidate struct {
 	acc      *Account
 	occupied int64
 	usage    float64
-	order    int
-	limit    int64
 }
 
-// scanRangeLocked 在 bucket[start:end) 范围内扫描可用账号。
-// 会话亲和仍按哈希落点取第一个可用号；其余请求在同用量档（或 round_robin
-// 的整个优先级段）里优先 OccupiedRequests 最低的账号，用扫描顺序打平。
-// 返回 stale=true 表示桶内缓存已过期，调用方应重新开始扫描。
-func (s *FastScheduler) scanRangeLocked(expectedTier AccountHealthTier, rangeStart, rangeEnd int, cursor *atomic.Uint64, affinityHash *uint64, baseLimit int64, now time.Time, apiKeyID int64, exclude map[int64]bool, filter AccountFilter, policy DispatchPolicy) (*Account, bool) {
+// scanRangeLocked copies a bounded window while holding mu, then releases mu
+// for callbacks. Never read the bucket slice after a generation change: an
+// Update, Remove or concurrent selection may have moved its entries.
+func (s *FastScheduler) scanRangeLocked(expectedTier AccountHealthTier, rangeStart, rangeEnd int, cursor *atomic.Uint64, affinityHash *uint64, apiKeyID int64, exclude map[int64]bool, filter AccountFilter, policy DispatchPolicy, inspectOnly bool, stats *fastSelectionStats) (*Account, bool) {
 	bucket := s.buckets[expectedTier]
 	rangeLen := rangeEnd - rangeStart
 	if rangeLen <= 0 {
 		return nil, false
 	}
 	start := int(cursor.Add(1)-1) % rangeLen
+	windowSize := fastSchedulerCandidateWindow
 	if affinityHash != nil {
 		start = int(*affinityHash % uint64(rangeLen))
+		windowSize = 1 // retain deterministic affinity order
 	}
-	var candidates []fastSchedulerCandidate
-	for offset := 0; offset < rangeLen; offset++ {
-		entry := bucket[rangeStart+(start+offset)%rangeLen]
-		if entry.acc == nil {
-			continue
-		}
-		if exclude != nil && exclude[entry.dbID] {
-			continue
-		}
-		if !entry.acc.AllowsAPIKey(apiKeyID) {
-			continue
-		}
-		if s.groupCheck != nil && !s.groupCheck(apiKeyID, entry.acc) {
-			continue
-		}
-		if filter != nil && !filter(entry.acc) {
-			continue
-		}
-		tier, dispatchScore, limit, proven, available := entry.acc.fastSchedulerSnapshotForPolicy(baseLimit, now, policy)
-		tier, keepTier := s.normalizeRetainedTier(tier, expectedTier)
-		if !keepTier {
-			s.removeLocked(entry.dbID)
-			return nil, true
-		}
-		if tier != expectedTier {
-			// 健康层级变了，条目要换桶，桶边界随之变化，必须重新开始扫描。
-			s.removeLocked(entry.dbID)
-			if s.retainUnavailable || entry.acc.fastSchedulerKeepInPool(baseLimit, now, tier, limit, available) {
-				s.insertLocked(entry.acc, now)
-			}
-			return nil, true
-		}
-		if proven != entry.proven || math.Abs(dispatchScore-entry.dispatchScore) >= 1 {
-			// 同层级内的排序键漂移：就地刷新缓存并标记待重排，继续扫完本轮。
-			// 每次漂移都重启整轮扫描会让大号池下的一次取号反复全量重排。
-			s.refreshEntryLocked(expectedTier, rangeStart+(start+offset)%rangeLen, dispatchScore, proven)
-		}
-		if !available || limit <= 0 {
-			continue
-		}
-		occupied := accountOccupiedRequests(entry.acc)
-		if occupied >= limit {
-			continue
-		}
-		if affinityHash != nil {
-			if !s.tryAcquireAccount(entry.acc, limit) {
+	quotaMode := s.schedulerMode == "remaining_quota" || s.schedulerMode == "fill_first"
+	for offset := 0; offset < rangeLen; {
+		var candidates [fastSchedulerCandidateWindow]fastSchedulerCandidate
+		count := 0
+		now := time.Now()
+		for offset < rangeLen && count < windowSize {
+			idx := rangeStart + (start+offset)%rangeLen
+			offset++
+			stats.scanned++
+			entry := bucket[idx]
+			if entry.acc == nil || exclude != nil && exclude[entry.dbID] || accountDispatchBlocked(entry.acc) {
 				continue
 			}
-			return entry.acc, false
+			tier, score, limit, proven, available := entry.acc.fastSchedulerSnapshotForPolicy(s.baseLimit, now, policy)
+			tier, keepTier := s.normalizeRetainedTier(tier, expectedTier)
+			if !keepTier {
+				s.removeLocked(entry.dbID)
+				return nil, true
+			}
+			if tier != expectedTier {
+				s.removeLocked(entry.dbID)
+				if s.retainUnavailable || entry.acc.fastSchedulerKeepInPool(s.baseLimit, now, tier, limit, available) {
+					s.insertLocked(entry.acc, now)
+				}
+				return nil, true
+			}
+			if proven != entry.proven || math.Abs(score-entry.dispatchScore) >= 1 {
+				s.refreshEntryLocked(expectedTier, idx, score, proven)
+			}
+			occupied := accountOccupiedRequests(entry.acc)
+			if !available || limit <= 0 || occupied >= limit {
+				continue
+			}
+			candidate := fastSchedulerCandidate{acc: entry.acc, occupied: occupied}
+			if quotaMode {
+				candidate.usage = entry.acc.usagePercentForScheduling()
+			}
+			candidates[count] = candidate
+			count++
 		}
-		candidates = append(candidates, fastSchedulerCandidate{
-			acc:      entry.acc,
-			occupied: occupied,
-			usage:    entry.acc.usagePercentForScheduling(),
-			order:    offset,
-			limit:    limit,
-		})
-	}
-	if affinityHash != nil || len(candidates) == 0 {
-		return nil, false
-	}
-	if s.schedulerMode == "remaining_quota" || s.schedulerMode == "fill_first" {
-		targetUsage := candidates[0].usage
-		filtered := make([]fastSchedulerCandidate, 0, len(candidates))
-		for _, candidate := range candidates {
-			if candidate.usage == targetUsage {
-				filtered = append(filtered, candidate)
+		if count == 0 {
+			continue
+		}
+		// Stable insertion sort of at most eight entries needs no allocations.
+		for i := 1; i < count; i++ {
+			for j := i; j > 0; j-- {
+				a, b := candidates[j], candidates[j-1]
+				less := a.occupied < b.occupied
+				if quotaMode && a.usage != b.usage {
+					less = a.usage < b.usage
+					if s.schedulerMode == "fill_first" {
+						less = a.usage > b.usage
+					}
+				}
+				if !less {
+					break
+				}
+				candidates[j], candidates[j-1] = b, a
 			}
 		}
-		candidates = filtered
-	}
-	sort.SliceStable(candidates, func(i, j int) bool {
-		if candidates[i].occupied != candidates[j].occupied {
-			return candidates[i].occupied < candidates[j].occupied
-		}
-		return candidates[i].order < candidates[j].order
-	})
-	for _, candidate := range candidates {
-		if s.tryAcquireAccount(candidate.acc, candidate.limit) {
-			return candidate.acc, false
+		acc, stale := s.acquireCandidatesOutsideLock(candidates[:count], expectedTier, apiKeyID, filter, policy, inspectOnly, stats)
+		if acc != nil || stale {
+			return acc, stale
 		}
 	}
 	return nil, false
+}
+
+// The caller owns mu on entry and on return, including panic unwinding. No
+// filter, group check or admission callback may keep other selections and
+// state updates waiting on this scheduler's lock.
+func (s *FastScheduler) acquireCandidatesOutsideLock(candidates []fastSchedulerCandidate, expectedTier AccountHealthTier, apiKeyID int64, filter AccountFilter, policy DispatchPolicy, inspectOnly bool, stats *fastSelectionStats) (selected *Account, stale bool) {
+	generation, groupCheck, acquire := s.generation, s.groupCheck, s.acquire
+	s.mu.Unlock()
+	defer func() {
+		started := time.Now()
+		s.mu.Lock()
+		stats.lockWait += time.Since(started)
+		if selected == nil && !stale && s.generation != generation {
+			stale = true
+			stats.restarts++
+		}
+	}()
+	for _, candidate := range candidates {
+		acc := candidate.acc
+		if !acc.AllowsAPIKey(apiKeyID) || groupCheck != nil && !groupCheck(apiKeyID, acc) {
+			continue
+		}
+		if filter != nil {
+			stats.filterChecks++
+			if !filter(acc) {
+				continue
+			}
+		}
+		s.mu.RLock()
+		current := s.generation == generation
+		baseLimit := s.baseLimit
+		s.mu.RUnlock()
+		if !current {
+			stats.restarts++
+			return nil, true
+		}
+		// A slow filter can outlive a cooldown/disable/concurrency change.
+		tier, _, limit, _, available := acc.fastSchedulerSnapshotForPolicy(baseLimit, time.Now(), policy)
+		if !available || limit <= 0 || accountDispatchBlocked(acc) || accountOccupiedRequests(acc) >= limit {
+			continue
+		}
+		if tier != expectedTier {
+			// Account state can change before its writer reaches Update.
+			// Restart so the locked scan repairs the bucket and its priority.
+			return nil, true
+		}
+		if inspectOnly {
+			return acc, false
+		}
+		acquired := false
+		if acquire != nil {
+			acquired = acquire(acc, limit)
+		} else {
+			acquired = tryAcquireAccount(acc, limit)
+		}
+		if acquired {
+			return acc, false
+		}
+		stats.acquireFailures++
+	}
+	s.mu.RLock()
+	stale = s.generation != generation
+	s.mu.RUnlock()
+	if stale {
+		stats.restarts++
+	}
+	return nil, stale
 }
 
 // refreshEntryLocked 就地刷新桶内某个下标的排序键缓存，顺序被破坏时打上待重排标记。
@@ -667,23 +719,21 @@ func (s *FastScheduler) refreshEntryLocked(tier AccountHealthTier, idx int, disp
 	if idx < 0 || idx >= len(entries) || entries[idx].acc == nil {
 		return
 	}
+	previousPriority := entries[idx].priority
 	entries[idx].dispatchScore = dispatchScore
 	entries[idx].proven = proven
 	entries[idx].priority = entries[idx].acc.schedulerPriority()
+	if previousPriority != entries[idx].priority {
+		s.generation++
+	}
 	if s.entryOutOfOrderLocked(tier, entries, idx) {
+		s.generation++
 		s.unsorted[tier] = true
 	}
 }
 
 func (s *FastScheduler) Release(acc *Account) {
 	releaseOccupiedAccountSlot(acc)
-}
-
-func (s *FastScheduler) tryAcquireAccount(acc *Account, limit int64) bool {
-	if s != nil && s.acquire != nil {
-		return s.acquire(acc, limit)
-	}
-	return tryAcquireAccount(acc, limit)
 }
 
 func (s *FastScheduler) BucketSizes() map[AccountHealthTier]int {
@@ -724,6 +774,7 @@ func (s *FastScheduler) removeLocked(dbID int64) {
 	if !ok {
 		return
 	}
+	s.generation++
 
 	entries := s.buckets[pos.tier]
 	if pos.index < 0 || pos.index >= len(entries) || entries[pos.index].dbID != dbID {
@@ -803,7 +854,7 @@ func (a *Account) fastSchedulerSnapshotForSpark(baseLimit int64, now time.Time) 
 	// sparkDispatchEligibleLocked 与 isAvailableLocked 一样只看锁内状态;
 	// DispatchPaused 是锁外原子标志,标准快照在这里显式补一道门,spark 必须
 	// 对齐,否则运维手动停调度或过载熔断置位的账号仍会被 spark 请求选中。
-	available := a.sparkDispatchEligibleLocked(now) && atomic.LoadInt32(&a.DispatchPaused) == 0
+	available := a.sparkDispatchEligibleLocked(now) && !accountDispatchBlocked(a)
 	return tier, score, limit, proven, available
 }
 
@@ -848,7 +899,7 @@ func (a *Account) fastSchedulerSnapshotWithUsageOverride(baseLimit int64, now ti
 
 	continuationUsageOverride := continuation && a.usageLimitContinuationEligibleLocked(now)
 	available := a.Status != StatusError && tier != HealthTierBanned && a.hasDispatchCredentialLocked()
-	if atomic.LoadInt32(&a.DispatchPaused) != 0 {
+	if accountDispatchBlocked(a) {
 		available = false
 	}
 	if a.Status == StatusCooldown && now.Before(a.CooldownUtil) && !continuationUsageOverride {
