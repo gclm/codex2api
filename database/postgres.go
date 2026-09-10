@@ -4978,21 +4978,30 @@ type TrafficSnapshot struct {
 // GetUsageStats 聚合用量统计。channel 非空（codex/grok/antigravity/claude）时按渠道过滤；
 // 渠道视图下的「累计」只覆盖现存 usage_logs（清空日志前的 baseline 无渠道维度，不计入）。
 func (db *DB) GetUsageStats(ctx context.Context, rangeStart, rangeEnd time.Time, channel string) (*UsageStats, error) {
-	return db.getUsageStats(ctx, rangeStart, rangeEnd, channel, true)
+	return db.getUsageStats(ctx, rangeStart, rangeEnd, channel, true, UsageLogFilter{})
+}
+
+// GetUsageStatsFiltered 在 GetUsageStats 基础上按 dim 的维度条件(账号/密钥/模型/端点/搜索词/形态开关)
+// 收窄区间口径:today_*、rpm/tpm、错误率、延迟与分项统计都只覆盖命中的日志;
+// total_* 累计字段保持全局(或渠道)口径不变,因为累计 rollup 没有维度信息。
+// dim 里的时间范围、渠道与状态类条件被忽略,分别以显式参数与 channel 为准。
+func (db *DB) GetUsageStatsFiltered(ctx context.Context, rangeStart, rangeEnd time.Time, channel string, dim UsageLogFilter, includeBreakdowns bool) (*UsageStats, error) {
+	return db.getUsageStats(ctx, rangeStart, rangeEnd, channel, includeBreakdowns, dim)
 }
 
 // GetUsageStatsSummary returns only the aggregate fields used by the dashboard.
 // It deliberately skips model, endpoint, API-key and feature breakdowns, which
 // otherwise require four additional scans over the selected usage-log range.
 func (db *DB) GetUsageStatsSummary(ctx context.Context, rangeStart, rangeEnd time.Time, channel string) (*UsageStats, error) {
-	return db.getUsageStats(ctx, rangeStart, rangeEnd, channel, false)
+	return db.getUsageStats(ctx, rangeStart, rangeEnd, channel, false, UsageLogFilter{})
 }
 
-func (db *DB) getUsageStats(ctx context.Context, rangeStart, rangeEnd time.Time, channel string, includeBreakdowns bool) (*UsageStats, error) {
+func (db *DB) getUsageStats(ctx context.Context, rangeStart, rangeEnd time.Time, channel string, includeBreakdowns bool, dim UsageLogFilter) (*UsageStats, error) {
 	channel = strings.TrimSpace(channel)
 	explicitRange := !rangeStart.IsZero()
+	dimFiltered := dim.HasDimensionFilter()
 	if db.isSQLite() {
-		return db.getUsageStatsSQLite(ctx, rangeStart, rangeEnd, channel, includeBreakdowns)
+		return db.getUsageStatsSQLite(ctx, rangeStart, rangeEnd, channel, includeBreakdowns, dim)
 	}
 
 	stats := &UsageStats{}
@@ -5011,6 +5020,13 @@ func (db *DB) getUsageStats(ctx context.Context, rangeStart, rangeEnd time.Time,
 		endClause += fmt.Sprintf(" AND channel = $%d", len(args)+1)
 		args = append(args, channel)
 	}
+	if dimFiltered {
+		dimParts, dimArgs := usageLogDimensionWhere(dim, len(args)+1)
+		for _, part := range dimParts {
+			endClause += " AND " + part
+		}
+		args = append(args, dimArgs...)
+	}
 
 	todayQuery := `
 	SELECT
@@ -5027,7 +5043,7 @@ func (db *DB) getUsageStats(ctx context.Context, rangeStart, rangeEnd time.Time,
 		COALESCE(AVG(duration_ms), 0) AS avg_duration_ms,
 		COALESCE(SUM(CASE WHEN cached_tokens > 0 THEN 1 ELSE 0 END), 0) AS today_cache_hit_requests,
 		COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0) AS today_errors
-	FROM usage_logs
+	FROM usage_logs u
 	WHERE created_at >= $1` + endClause + `
 	  AND status_code <> 499
 	  AND TRIM(COALESCE(internal_reason, '')) = ''
@@ -5067,7 +5083,7 @@ func (db *DB) getUsageStats(ctx context.Context, rangeStart, rangeEnd time.Time,
 	if stats.TotalRequests > 0 {
 		stats.TotalCacheRate = float64(rollup.CacheHitRequests) / float64(stats.TotalRequests) * 100
 	}
-	if !explicitRange && rollup.FirstTokenSamples > 0 {
+	if !explicitRange && !dimFiltered && rollup.FirstTokenSamples > 0 {
 		stats.AvgFirstTokenMs = rollup.FirstTokenMsSum / float64(rollup.FirstTokenSamples)
 	}
 	if stats.TotalRequests > 0 {
@@ -5079,11 +5095,11 @@ func (db *DB) getUsageStats(ctx context.Context, rangeStart, rangeEnd time.Time,
 		stats.ErrorRate = float64(todayErrors) / float64(stats.TodayRequests) * 100
 	}
 	if includeBreakdowns {
-		stats.ModelStats, err = db.getUsageModelStats(ctx, 10, rangeStart, rangeEnd, channel)
+		stats.ModelStats, err = db.getUsageModelStats(ctx, 10, rangeStart, rangeEnd, channel, dim)
 		if err != nil {
 			return nil, err
 		}
-		if err := db.populateUsageBreakdownStats(ctx, stats, rangeStart, rangeEnd, channel); err != nil {
+		if err := db.populateUsageBreakdownStats(ctx, stats, rangeStart, rangeEnd, channel, dim); err != nil {
 			return nil, err
 		}
 	} else {
@@ -5122,7 +5138,9 @@ func (db *DB) CountTodayRequestsByChannel(ctx context.Context) (map[string]int64
 	return out, rows.Err()
 }
 
-func (db *DB) usageStatsTimeWhere(column string, rangeStart, rangeEnd time.Time, channel string) (string, []interface{}) {
+// usageStatsTimeWhere 生成区间统计的 WHERE 片段:时间范围 + 渠道 + dim 的维度条件。
+// 维度条件带 u. 前缀,调用方 FROM 需写成 usage_logs u。
+func (db *DB) usageStatsTimeWhere(column string, rangeStart, rangeEnd time.Time, channel string, dim UsageLogFilter) (string, []interface{}) {
 	if strings.TrimSpace(column) == "" {
 		column = "created_at"
 	}
@@ -5136,14 +5154,21 @@ func (db *DB) usageStatsTimeWhere(column string, rangeStart, rangeEnd time.Time,
 		where += fmt.Sprintf(" AND channel = $%d", len(args)+1)
 		args = append(args, channel)
 	}
+	if dim.HasDimensionFilter() {
+		dimParts, dimArgs := usageLogDimensionWhere(dim, len(args)+1)
+		for _, part := range dimParts {
+			where += " AND " + part
+		}
+		args = append(args, dimArgs...)
+	}
 	return where, args
 }
 
-func (db *DB) getUsageModelStats(ctx context.Context, limit int, rangeStart, rangeEnd time.Time, channel string) ([]UsageModelStat, error) {
+func (db *DB) getUsageModelStats(ctx context.Context, limit int, rangeStart, rangeEnd time.Time, channel string, dim UsageLogFilter) ([]UsageModelStat, error) {
 	if limit <= 0 {
 		limit = 10
 	}
-	timeWhere, args := db.usageStatsTimeWhere("created_at", rangeStart, rangeEnd, channel)
+	timeWhere, args := db.usageStatsTimeWhere("created_at", rangeStart, rangeEnd, channel, dim)
 	limitPlaceholder := fmt.Sprintf("$%d", len(args)+1)
 	args = append(args, limit)
 	rows, err := db.conn.QueryContext(ctx, `
@@ -5157,7 +5182,7 @@ func (db *DB) getUsageModelStats(ctx context.Context, limit int, rangeStart, ran
 			COALESCE(SUM(account_billed), 0) AS account_billed,
 			COALESCE(SUM(user_billed), 0) AS user_billed,
 			COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0) AS error_count
-		FROM usage_logs
+		FROM usage_logs u
 		WHERE `+timeWhere+` AND status_code <> 499
 		  AND TRIM(COALESCE(internal_reason, '')) = ''
 		GROUP BY 1
@@ -5196,11 +5221,11 @@ func (db *DB) getUsageModelStats(ctx context.Context, limit int, rangeStart, ran
 	return stats, nil
 }
 
-func (db *DB) populateUsageBreakdownStats(ctx context.Context, stats *UsageStats, rangeStart, rangeEnd time.Time, channel string) error {
+func (db *DB) populateUsageBreakdownStats(ctx context.Context, stats *UsageStats, rangeStart, rangeEnd time.Time, channel string, dim UsageLogFilter) error {
 	if stats == nil {
 		return nil
 	}
-	timeWhere, args := db.usageStatsTimeWhere("created_at", rangeStart, rangeEnd, channel)
+	timeWhere, args := db.usageStatsTimeWhere("created_at", rangeStart, rangeEnd, channel, dim)
 	if err := db.conn.QueryRowContext(ctx, `
 		SELECT
 			COALESCE(SUM(CASE WHEN stream THEN 1 ELSE 0 END), 0) AS stream_requests,
@@ -5214,7 +5239,7 @@ func (db *DB) populateUsageBreakdownStats(ctx context.Context, stats *UsageStats
 			-- is_retry_attempt 标的是「本次失败且将要重试」的那条失败记录，算进来会重复计一次。
 			COALESCE(SUM(CASE WHEN attempt_index > 1 THEN 1 ELSE 0 END), 0) AS retry_requests,
 			COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0) AS error_requests
-		FROM usage_logs
+		FROM usage_logs u
 		WHERE `+timeWhere+` AND status_code <> 499
 		  AND TRIM(COALESCE(internal_reason, '')) = ''
 	`, args...).Scan(
@@ -5230,11 +5255,11 @@ func (db *DB) populateUsageBreakdownStats(ctx context.Context, stats *UsageStats
 		return err
 	}
 
-	endpoints, err := db.getUsageEndpointStats(ctx, 8, rangeStart, rangeEnd, channel)
+	endpoints, err := db.getUsageEndpointStats(ctx, 8, rangeStart, rangeEnd, channel, dim)
 	if err != nil {
 		return err
 	}
-	apiKeys, err := db.getUsageAPIKeyStats(ctx, 8, rangeStart, rangeEnd, channel)
+	apiKeys, err := db.getUsageAPIKeyStats(ctx, 8, rangeStart, rangeEnd, channel, dim)
 	if err != nil {
 		return err
 	}
@@ -5243,11 +5268,11 @@ func (db *DB) populateUsageBreakdownStats(ctx context.Context, stats *UsageStats
 	return nil
 }
 
-func (db *DB) getUsageEndpointStats(ctx context.Context, limit int, rangeStart, rangeEnd time.Time, channel string) ([]UsageEndpointStat, error) {
+func (db *DB) getUsageEndpointStats(ctx context.Context, limit int, rangeStart, rangeEnd time.Time, channel string, dim UsageLogFilter) ([]UsageEndpointStat, error) {
 	if limit <= 0 {
 		limit = 8
 	}
-	timeWhere, args := db.usageStatsTimeWhere("created_at", rangeStart, rangeEnd, channel)
+	timeWhere, args := db.usageStatsTimeWhere("created_at", rangeStart, rangeEnd, channel, dim)
 	limitPlaceholder := fmt.Sprintf("$%d", len(args)+1)
 	args = append(args, limit)
 	rows, err := db.conn.QueryContext(ctx, `
@@ -5257,7 +5282,7 @@ func (db *DB) getUsageEndpointStats(ctx context.Context, limit int, rangeStart, 
 			COALESCE(SUM(total_tokens), 0) AS tokens,
 			COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0) AS error_count,
 			COALESCE(SUM(user_billed), 0) AS user_billed
-		FROM usage_logs
+		FROM usage_logs u
 		WHERE `+timeWhere+` AND status_code <> 499
 		  AND TRIM(COALESCE(internal_reason, '')) = ''
 		GROUP BY 1
@@ -5286,11 +5311,11 @@ func (db *DB) getUsageEndpointStats(ctx context.Context, limit int, rangeStart, 
 	return items, nil
 }
 
-func (db *DB) getUsageAPIKeyStats(ctx context.Context, limit int, rangeStart, rangeEnd time.Time, channel string) ([]UsageAPIKeyStat, error) {
+func (db *DB) getUsageAPIKeyStats(ctx context.Context, limit int, rangeStart, rangeEnd time.Time, channel string, dim UsageLogFilter) ([]UsageAPIKeyStat, error) {
 	if limit <= 0 {
 		limit = 8
 	}
-	timeWhere, args := db.usageStatsTimeWhere("created_at", rangeStart, rangeEnd, channel)
+	timeWhere, args := db.usageStatsTimeWhere("created_at", rangeStart, rangeEnd, channel, dim)
 	limitPlaceholder := fmt.Sprintf("$%d", len(args)+1)
 	args = append(args, limit)
 	rows, err := db.conn.QueryContext(ctx, `
@@ -5301,7 +5326,7 @@ func (db *DB) getUsageAPIKeyStats(ctx context.Context, limit int, rangeStart, ra
 			COALESCE(SUM(total_tokens), 0) AS tokens,
 			COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0) AS error_count,
 			COALESCE(SUM(user_billed), 0) AS user_billed
-		FROM usage_logs
+		FROM usage_logs u
 		WHERE `+timeWhere+` AND status_code <> 499
 		  AND TRIM(COALESCE(internal_reason, '')) = ''
 		GROUP BY 1, 2
@@ -5937,11 +5962,70 @@ type UsageLogFilter struct {
 	ViaWebsocketOnly      *bool  // nil=全部, true=仅 WebSocket, false=仅 HTTP
 }
 
-func (db *DB) buildUsageLogWhere(f UsageLogFilter) (string, []interface{}) {
-	startArg, endArg := db.timeRangeArgs(f.Start, f.End)
-	parts := []string{`u.created_at >= $1 AND u.created_at <= $2`}
-	args := []interface{}{startArg, endArg}
-	paramIdx := 3
+// HasDimensionFilter 报告过滤条件里是否带有"维度"约束(账号/密钥/模型/端点/搜索词/形态开关等)。
+// 时间范围、渠道与状态类条件不算维度:区间统计卡片天然按状态拆分(成功数/错误率),
+// 若再按状态过滤会让错误率恒为 0% 或 100%,所以统计口径只跟随维度条件。
+func (f UsageLogFilter) HasDimensionFilter() bool {
+	return f.Email != "" || f.RequestID != "" || f.UpstreamRequestID != "" ||
+		f.Model != "" || f.Endpoint != "" || f.APIKeyID != nil || f.AccountID != nil ||
+		f.FastOnly != nil || f.StreamOnly != nil || f.CompactOnly != nil ||
+		f.CompactionHistoryOnly != nil || f.RetryOnly != nil || f.ViaWebsocketOnly != nil ||
+		f.Query != ""
+}
+
+// DimensionKey 把维度条件压成稳定字符串,供缓存键区分不同筛选组合。无维度条件时返回空串。
+func (f UsageLogFilter) DimensionKey() string {
+	if !f.HasDimensionFilter() {
+		return ""
+	}
+	var b strings.Builder
+	writeStr := func(name, value string) {
+		if value != "" {
+			b.WriteString(name)
+			b.WriteByte('=')
+			b.WriteString(value)
+			b.WriteByte(';')
+		}
+	}
+	writeInt := func(name string, value *int64) {
+		if value != nil {
+			b.WriteString(name)
+			b.WriteByte('=')
+			b.WriteString(strconv.FormatInt(*value, 10))
+			b.WriteByte(';')
+		}
+	}
+	writeBool := func(name string, value *bool) {
+		if value != nil {
+			b.WriteString(name)
+			b.WriteByte('=')
+			b.WriteString(strconv.FormatBool(*value))
+			b.WriteByte(';')
+		}
+	}
+	writeStr("email", f.Email)
+	writeStr("rid", f.RequestID)
+	writeStr("urid", f.UpstreamRequestID)
+	writeStr("model", f.Model)
+	writeStr("endpoint", f.Endpoint)
+	writeInt("key", f.APIKeyID)
+	writeInt("acct", f.AccountID)
+	writeBool("fast", f.FastOnly)
+	writeBool("stream", f.StreamOnly)
+	writeBool("compact", f.CompactOnly)
+	writeBool("history", f.CompactionHistoryOnly)
+	writeBool("retry", f.RetryOnly)
+	writeBool("ws", f.ViaWebsocketOnly)
+	writeStr("q", f.Query)
+	return b.String()
+}
+
+// usageLogDimensionWhere 生成维度条件片段(见 HasDimensionFilter),不含时间/渠道/状态类条件。
+// 列引用统一带 u. 前缀,调用方的 FROM 需给 usage_logs 起别名 u;占位符从 nextIdx 起编号。
+func usageLogDimensionWhere(f UsageLogFilter, nextIdx int) ([]string, []interface{}) {
+	parts := []string{}
+	args := []interface{}{}
+	paramIdx := nextIdx
 	addArg := func(value interface{}) string {
 		placeholder := fmt.Sprintf("$%d", paramIdx)
 		args = append(args, value)
@@ -5949,12 +6033,6 @@ func (db *DB) buildUsageLogWhere(f UsageLogFilter) (string, []interface{}) {
 		return placeholder
 	}
 
-	if !f.IncludeCanceled {
-		parts = append(parts, `u.status_code <> 499`)
-	}
-	if f.ErrorOnly {
-		parts = append(parts, `(u.status_code >= 400 OR COALESCE(u.error_message, '') <> '' OR COALESCE(u.upstream_error_kind, '') <> '')`)
-	}
 	if f.Email != "" {
 		p := addArg("%" + f.Email + "%")
 		parts = append(parts, fmt.Sprintf(`(
@@ -6017,26 +6095,6 @@ func (db *DB) buildUsageLogWhere(f UsageLogFilter) (string, []interface{}) {
 		p := addArg(*f.ViaWebsocketOnly)
 		parts = append(parts, fmt.Sprintf(`COALESCE(u.via_websocket, false) = %s`, p))
 	}
-	if f.StatusCode > 0 {
-		p := addArg(f.StatusCode)
-		parts = append(parts, fmt.Sprintf(`u.status_code = %s`, p))
-	}
-	switch strings.ToLower(strings.TrimSpace(f.StatusFamily)) {
-	case "2xx":
-		parts = append(parts, `u.status_code >= 200 AND u.status_code < 300`)
-	case "4xx":
-		parts = append(parts, `u.status_code >= 400 AND u.status_code < 500`)
-	case "5xx":
-		parts = append(parts, `u.status_code >= 500 AND u.status_code < 600`)
-	}
-	if f.ErrorKind != "" {
-		p := addArg(f.ErrorKind)
-		parts = append(parts, fmt.Sprintf(`COALESCE(u.upstream_error_kind, '') = %s`, p))
-	}
-	if channel := strings.TrimSpace(f.Channel); channel != "" {
-		p := addArg(channel)
-		parts = append(parts, fmt.Sprintf(`COALESCE(u.channel, '') = %s`, p))
-	}
 	if f.Query != "" {
 		p := addArg("%" + f.Query + "%")
 		parts = append(parts, fmt.Sprintf(`(
@@ -6058,6 +6116,52 @@ func (db *DB) buildUsageLogWhere(f UsageLogFilter) (string, []interface{}) {
 						OR LOWER(COALESCE(CAST(search_accounts.credentials AS TEXT), '')) LIKE LOWER(%[1]s)
 				)
 		)`, p))
+	}
+	return parts, args
+}
+
+func (db *DB) buildUsageLogWhere(f UsageLogFilter) (string, []interface{}) {
+	startArg, endArg := db.timeRangeArgs(f.Start, f.End)
+	parts := []string{`u.created_at >= $1 AND u.created_at <= $2`}
+	args := []interface{}{startArg, endArg}
+
+	if !f.IncludeCanceled {
+		parts = append(parts, `u.status_code <> 499`)
+	}
+	if f.ErrorOnly {
+		parts = append(parts, `(u.status_code >= 400 OR COALESCE(u.error_message, '') <> '' OR COALESCE(u.upstream_error_kind, '') <> '')`)
+	}
+
+	dimParts, dimArgs := usageLogDimensionWhere(f, len(args)+1)
+	parts = append(parts, dimParts...)
+	args = append(args, dimArgs...)
+
+	paramIdx := len(args) + 1
+	addArg := func(value interface{}) string {
+		placeholder := fmt.Sprintf("$%d", paramIdx)
+		args = append(args, value)
+		paramIdx++
+		return placeholder
+	}
+	if f.StatusCode > 0 {
+		p := addArg(f.StatusCode)
+		parts = append(parts, fmt.Sprintf(`u.status_code = %s`, p))
+	}
+	switch strings.ToLower(strings.TrimSpace(f.StatusFamily)) {
+	case "2xx":
+		parts = append(parts, `u.status_code >= 200 AND u.status_code < 300`)
+	case "4xx":
+		parts = append(parts, `u.status_code >= 400 AND u.status_code < 500`)
+	case "5xx":
+		parts = append(parts, `u.status_code >= 500 AND u.status_code < 600`)
+	}
+	if f.ErrorKind != "" {
+		p := addArg(f.ErrorKind)
+		parts = append(parts, fmt.Sprintf(`COALESCE(u.upstream_error_kind, '') = %s`, p))
+	}
+	if channel := strings.TrimSpace(f.Channel); channel != "" {
+		p := addArg(channel)
+		parts = append(parts, fmt.Sprintf(`COALESCE(u.channel, '') = %s`, p))
 	}
 
 	return strings.Join(parts, " AND "), args
