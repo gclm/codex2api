@@ -507,6 +507,12 @@ Grok 账号编辑页支持账号级模型映射，可让只请求 GPT 模型名�
 
 映射适用于普通 HTTP `POST /v1/responses`、`POST /v1/chat/completions` 和 `POST /v1/messages`。Responses WebSocket 与 `/v1/responses/compact` 不会路由到 Grok。Codex 客户端的 function、namespace、custom、deferred `additional_tools` 和 `tool_search` 可经现有协议桥接；Web Search、File Search、Code Interpreter、Shell、MCP、图片生成等托管工具仍取决于具体 Grok 上游及协议能力，不能仅靠模型别名获得 OpenAI 后端的等价能力。
 
+Codex 的流式 remote compact v2（`POST /v1/responses`，`stream:true`，`input` 含 `compaction_trigger`）允许路由到模型目录中使用 Responses 协议的 Grok 账号，沿用 compact 模型映射。该请求继续发送到 Grok 实际路由的 `/responses`。若上游以 400/422 明确拒绝 `compaction_trigger` 类型，网关使用同一账号、模型和上下文追加一次摘要请求，并返回可回传的 `compaction` 项；其他鉴权、限流或校验错误不会触发该兼容分支。摘要为空、不完整或产生工具调用时会返回失败，不会清空历史伪装成压缩成功。独立 `/v1/responses/compact` 和非流式触发器仍使用专用 compact 链路，不开放给 Grok。
+
+网关记录成功返回的压缩状态来源。已知 Grok 压缩状态只回到创建它的账号，并按项原样保留密文；来源账号不可用时返回 `503 compaction_upstream_unavailable`，不会改用其他账号。未知来源或来源缓存不可用时仍沿用既有调度和外来密文降级规则，不保证保留这些压缩项中的上下文。上游拒绝已知来源的 Grok 压缩状态时，网关保留错误，不通过删除该状态重试来掩盖上下文丢失。
+
+上述来源绑定适用于上游原生不透明状态。网关生成的兼容摘要使用 `codex2api-emulated-compaction-v1:` 前缀和 Base64 封装，是可解码的文本摘要，不是上游加密密文。续聊时会还原成摘要消息并恢复正常调度，无需依赖原账号或来源缓存；摘要请求的 token 用量沿用上游返回值计入本次请求。
+
 ### 6. Health Check
 
 **端点:** `GET /health`
