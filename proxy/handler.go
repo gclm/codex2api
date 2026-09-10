@@ -1436,6 +1436,7 @@ func (h *Handler) logUsage(input *database.UsageLogInput) {
 	// failure and transport-retry paths cannot accidentally omit it. A retry
 	// that switches accounts naturally resolves the replacement account here.
 	// Non-Grok and unresolved accounts deliberately remain legacy/unscoped (0).
+	input = database.SnapshotUsageLogBilling(input)
 	h.populateUsageCredentialGeneration(input)
 	// scope 维度预算（issue #439）在日志落库前先吃到这笔消耗，抵掉窗口聚合缓存的滞后。
 	h.recordAPIKeyScopeUsage(input)
@@ -1520,6 +1521,10 @@ func (h *Handler) logUsageForRequest(c *gin.Context, input *database.UsageLogInp
 	populateUpstreamTrace(c, input)
 	populateCompactUsageMetaFromRequest(c, input)
 	markCyberPolicyUsageKind(input)
+	input = database.SnapshotUsageLogBilling(input)
+	if deferImageUsage(c, h, input) {
+		return
+	}
 	h.logUsage(input)
 }
 
@@ -3089,12 +3094,22 @@ func (h *Handler) APIKeyAuthMiddleware() gin.HandlerFunc {
 	return h.authMiddleware()
 }
 
+// APIKeyReadAuthMiddleware permits exhausted keys to retrieve their own stored
+// results. All other authentication checks remain in force; writes stay blocked.
+func (h *Handler) APIKeyReadAuthMiddleware() gin.HandlerFunc {
+	return h.authMiddlewareWithQuotaRead(true)
+}
+
 // authMiddleware API Key 鉴权中间件（增强版，带安全日志）
 //
 // 安全策略（fail-closed）：
 //   - 默认情况下，未配置任何 API Key 时直接拒绝请求（503），避免裸奔账号池。
 //   - 仅当显式设置 CODEX_ALLOW_ANONYMOUS=true 时才在无密钥情况下放行（兼容内网/测试）。
 func (h *Handler) authMiddleware() gin.HandlerFunc {
+	return h.authMiddlewareWithQuotaRead(false)
+}
+
+func (h *Handler) authMiddlewareWithQuotaRead(allowQuotaRead bool) gin.HandlerFunc {
 	allowAnonymous := h.cfg != nil && h.cfg.AllowAnonymousV1
 	return func(c *gin.Context) {
 		attachUserAgentAudit(c)
@@ -3167,7 +3182,8 @@ func (h *Handler) authMiddleware() gin.HandlerFunc {
 			c.Abort()
 			return
 		}
-		if apiKeyRow.IsQuotaExhausted() {
+		readOnly := allowQuotaRead && (c.Request.Method == http.MethodGet || c.Request.Method == http.MethodHead)
+		if apiKeyRow.IsQuotaExhausted() && !readOnly {
 			maskedKey := security.MaskAPIKey(key)
 			security.SecurityAuditLog("AUTH_FAILED_QUOTA_EXHAUSTED", fmt.Sprintf("path=%s ip=%s key=%s", c.Request.URL.Path, c.ClientIP(), maskedKey))
 			api.SendError(c, api.NewAPIError(api.ErrCodeRateLimitReached, "API key quota exhausted", api.ErrorTypeRateLimit))

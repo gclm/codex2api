@@ -113,6 +113,7 @@ import type {
   PromptReviewTestResponse,
   PromptReviewAPIKeysResponse,
   PublicAPIKeyUsageResponse,
+  ImageStudioQuota,
   RecycleBinAccountsResponse,
   ResetCreditsDetailResponse,
   WhamDailyUsageResponse,
@@ -551,6 +552,8 @@ export const api = {
     if (params.pageSize) search.set('page_size', String(params.pageSize))
     return requestAPIKeyUsage<PublicAPIKeyUsageResponse>(`/summary?${search.toString()}`, apiKey)
   },
+  getPortalImageQuota: (apiKey: string) =>
+    requestImageStudioPortal<ImageStudioQuota>('/quota', apiKey),
   createPortalImageJob: (apiKey: string, data: CreateImageJobPayload) =>
     requestImageStudioPortal<ImageJobResponse>('/jobs', apiKey, { method: 'POST', body: JSON.stringify(data) }),
   createPortalImageEditJob: (apiKey: string, data: CreateImageJobPayload) =>

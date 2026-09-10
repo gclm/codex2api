@@ -2333,7 +2333,10 @@
     "apiKeyStatsDesc": "Call volume grouped by API key.",
     "noApiKeyStats": "No API key statistics yet",
     "tableWsAcquire": "Conn Acquire",
-    "channelAll": "All"
+    "channelAll": "All",
+    "imageBillingFormula": "{{count}} successful images × {{price}} / image = {{total}}",
+    "imageBillingNoCharge": "No deliverable images; no image fee.",
+    "imageUpstreamCost": "Upstream token cost: {{amount}}"
   },
   "promptFilter": {
     "title": "Prompt Filter",
@@ -4432,7 +4435,16 @@
       "refreshNoAccounts": "no accounts",
       "refreshNoSummary": "refresh returned no summary",
       "catalogMarkSeen": "Mark seen",
-      "newBadge": "NEW"
+      "newBadge": "NEW",
+      "imageBilling": {
+        "title": "Image billing for users",
+        "token": "By token",
+        "perImage": "Per successful image",
+        "unitPrice": "Price per image (USD)",
+        "hint": "Deduct successful images × unit price from the key balance. Failed images are free; partial batches charge only successful outputs. Token rates below track upstream cost separately.",
+        "tokenHint": "Charge by token usage. Changes apply to future requests; settled entries retain their original prices.",
+        "upstreamRates": "Upstream token cost (separate from image fees)"
+      }
     },
     "modelRegistryDesc": "Sync the official OpenAI Codex models page and merge it into the local model list.",
     "modelsEnabled": "Enabled Models",
@@ -5331,8 +5343,8 @@
       "noRecentJobs": "Your creations will appear here. Come back and pick up where you left off.",
       "loadingImage": "Loading your creation…",
       "quality": {
-          "xhigh": "Extra high",
-          "max": "Maximum",
+        "xhigh": "Extra high",
+        "max": "Maximum",
         "auto": "Auto quality",
         "high": "High quality",
         "medium": "Medium quality",
@@ -5712,6 +5724,71 @@
     }
   },
   "imageStudioPortal": {
+    "quota": {
+      "title": "My quota",
+      "description": "The cumulative allowance for this API key, in USD.",
+      "remaining": "Remaining quota",
+      "lastKnownRemaining": "Last known remaining quota",
+      "remainingAmount": "Left {{amount}}",
+      "unlimited": "Unlimited",
+      "unlimitedLabel": "No total quota limit",
+      "limit": "Total quota",
+      "used": "Used",
+      "expiresAt": "Expires",
+      "neverExpires": "No expiry",
+      "loading": "Checking quota…",
+      "unavailable": "Quota unavailable",
+      "refreshFailed": "Quota update failed. Please retry",
+      "refresh": "Refresh quota",
+      "refreshing": "Refreshing…",
+      "quota_exhausted": "Quota exhausted. Contact your administrator to add more. Existing images can still be viewed and downloaded.",
+      "expired": "This key has expired. Contact your administrator to extend it.",
+      "settlementHint": "Updates automatically after usage settles. You can also refresh manually. Model request and rate limits still apply separately.",
+      "imagePrice": "{{price}} / image · charged on success"
+    },
+    "design": {
+      "eyebrow": "YOUR CREATIVE SPACE",
+      "title": "Turn an idea into an image",
+      "subtitle": "Start with a few words. Make something your own.",
+      "inspirationEyebrow": "A LITTLE INSPIRATION",
+      "inspirationTitle": "Your next image starts here.",
+      "inspirationDesc": "Choose a direction to fill in a prompt and canvas size, then make it your own.",
+      "inspirationCaption": "Illustrations are inspiration previews. Selecting one fills the prompt without generating.",
+      "mobileView": "Studio view",
+      "editPanel": "Editor",
+      "canvasPanel": "Canvas",
+      "creationMode": "Creation mode",
+      "yourPrompt": "Start with an idea",
+      "findInspiration": "Get inspired",
+      "promptPlaceholder": "Describe your subject, scene, and style… or choose an inspiration to get started.",
+      "promptHint": "Subject · Scene · Light · Style",
+      "autoSize": "Automatic",
+      "privateWorkspace": "Visible only to this key",
+      "canvasReady": "A space for your next idea",
+      "backToResult": "Back to result",
+      "runningHint": "Your image is being created. It will appear in your gallery when ready.",
+      "fullImageHint": "Full image, without cropping. Click to view full screen.",
+      "recentTitle": "Recent creations",
+      "allHistory": "View history",
+      "recentEmpty": "No creations yet. Start with an inspiration.",
+      "inspiration": {
+        "landscape": {
+          "title": "Into the wild",
+          "description": "Mountains · Morning light",
+          "prompt": "A cinematic mountain landscape: mist drifts over distant peaks, a winding river cuts through a deep green forest, and warm morning light touches the summits. Natural film colors, a peaceful, expansive composition, delicate light and shadow. Landscape orientation."
+        },
+        "product": {
+          "title": "Light & objects",
+          "description": "Soft light · Quiet details",
+          "prompt": "Minimal still-life photography of a matte olive-green ceramic vase with a naturally curved leafy branch on a cream stone pedestal. Soft afternoon side light, delicate textures and natural shadows, generous negative space. Square composition."
+        },
+        "architecture": {
+          "title": "Quiet spaces",
+          "description": "Warmth · Arches · Geometry",
+          "prompt": "A serene Mediterranean architectural space with cream stone walls and layered arches. Warm sunlight through a window casts crisp geometric shadows on the floor. Minimal design, fine sandstone textures, terracotta and cream tones. Portrait composition."
+        }
+      }
+    },
     "title": "Image Studio",
     "loginTitle": "Image Studio sign-in",
     "loginSubtitle": "Paste the API key issued by your admin to generate and edit images.",

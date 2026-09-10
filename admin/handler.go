@@ -1044,6 +1044,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	accountPortal.POST("/generate-auth-url", h.GenerateAccountPortalAuthURL)
 	accountPortal.POST("/submit-code", h.SubmitAccountPortalCode)
 
+	r.GET("/api/image-studio/quota", h.GetPortalImageQuota)
 	imageStudioPortal := r.Group("/api/image-studio")
 	imageStudioPortal.Use(h.imageStudioPortalAuthMiddleware())
 	imageStudioPortal.POST("/jobs", h.CreatePortalImageJob)

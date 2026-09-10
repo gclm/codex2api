@@ -259,6 +259,30 @@ Messages 的 `tool_use.input` 必须使用对象，因此自由文本工具输�
 
 ### 3. Images
 
+#### 公开工作台额度查询
+
+`GET /api/image-studio/quota` 使用 `Authorization: Bearer YOUR_API_KEY` 查询当前 Key 的累计美元额度。只受生图门户开关控制，不依赖公开用量页开关，也不接受通过查询参数指定其他 Key。
+
+```json
+{
+  "quota_limit": 25,
+  "quota_used": 6.4,
+  "quota_remaining": 18.6,
+  "expires_at": null,
+  "status": "active",
+  "refresh_after_seconds": 6,
+  "image_pricing": {
+    "gpt-image-2": { "user_billing_mode": "per_image", "image_unit_price": 0.05 }
+  }
+}
+```
+
+`quota_remaining` 为 `null` 表示没有累计额度上限，有限额度的剩余值最低为 `0`。`status` 为 `active`、`quota_exhausted` 或 `expired`；无效或停用的 Key 返回 `401`，生图门户关闭时返回 `404`。响应设置 `Cache-Control: no-store`，不返回原始 Key。
+
+公开工作台在 Key 旁显示剩余额度，可点击查看已用、总额和有效期。页面可见时每 30 秒刷新，回到页面或任务完成时也会刷新；消费异步结算，任务完成后按 `refresh_after_seconds` 再查询一次，该值为当前用量入库间隔加 1 秒。模型次数及其他限流规则仍单独生效。
+
+额度耗尽后，当前 Key 仍可查询自己的额度及读取公开工作台已有任务和图片；生成、编辑及删除操作继续拒绝。过期 Key 只能查询额度，不能读取作品或生成；停用 Key 无法使用这些接口。`/v1/*` 的现有额度检查不变。
+
 #### 生成图片
 
 **端点:** `POST /v1/images/generations`
@@ -1649,6 +1673,24 @@ HTTP `/v1/*` 响应的 `X-Codex2API-Request-ID` 对应下方可检索的 `reques
   "message": "日志已清空"
 }
 ```
+
+### 模型生图计费设置
+
+`PUT /api/admin/model-pricing`（`X-Admin-Key` 鉴权）可配置图片模型的用户计费方式：
+
+```json
+{
+  "model": "gpt-image-2",
+  "pricing": {
+    "user_billing_mode": "per_image",
+    "image_unit_price": 0.05
+  }
+}
+```
+
+`user_billing_mode` 为 `token`（默认）或 `per_image`；按张模式仅接受图片模型，且 `image_unit_price` 必须是大于 0 的美元金额。`GET /api/admin/model-pricing` 返回当前生效设置。保存时 `pricing` 替换该模型的整份手工覆盖，要保留自定义 Token 成本价格时一并提交原字段；`{"model":"gpt-image-2","reset":true}` 清除手工覆盖。
+
+按张模式下，成功图片张数 × 单价写入 `user_billed`，上游 Token 成本仍写入 `account_billed`。用量日志及 Key 公开用量记录新增 `user_billing_mode`、`image_unit_price`、`billed_image_count`；失败或未交付的图片费用为 0，历史记录不随调价重新计费。公开工作台额度响应的 `image_pricing` 仅提供用户计费方式和单价，不提供上游成本费率。完整行为见 [生图按张计费](CONFIGURATION.md#生图按张计费)。
 
 ### API Key 管理
 

@@ -3329,6 +3329,9 @@ export interface APIKeyAccountStatsResponse {
 }
 
 export interface UsageLog {
+  user_billing_mode?: '' | 'token' | 'per_image'
+  image_unit_price?: number
+  billed_image_count?: number
   request_id?: string
   upstream_request_id?: string
   upstream_proxy_id?: number
@@ -3454,6 +3457,8 @@ export interface ChartAggregation {
 }
 
 export interface ModelPricingOverride {
+  user_billing_mode?: 'token' | 'per_image'
+  image_unit_price?: number
   image_input?: number
   cached_image_input?: number
   source?: string
@@ -3721,6 +3726,16 @@ export interface UpdateAPIKeyRequest {
   enabled?: boolean
 }
 
+export interface ImageStudioQuota {
+  image_pricing?: Record<string, { user_billing_mode: 'token' | 'per_image'; image_unit_price?: number }>
+  quota_limit: number
+  quota_used: number
+  quota_remaining: number | null
+  expires_at: ISODateString | null
+  status: 'active' | 'expired' | 'quota_exhausted'
+  refresh_after_seconds: number
+}
+
 export interface PublicAPIKeyUsageKey {
   name: string
   key: string
@@ -3786,6 +3801,9 @@ export interface PublicAPIKeyUsageBreakdown {
 }
 
 export interface PublicAPIKeyUsageLog {
+  user_billing_mode?: '' | 'token' | 'per_image'
+  image_unit_price?: number
+  billed_image_count?: number
   id: number
   endpoint: string
   model: string
